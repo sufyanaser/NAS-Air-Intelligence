@@ -1,13 +1,15 @@
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
-import av
+import pytest
 from packaging.version import Version
 
 
 def test_pyav_version_is_below_19():
     """Ensure PyAV version remains below 19.0.0 to prevent metadata_errors breakage."""
+    av = pytest.importorskip("av")
     parsed = Version(av.__version__)
     msg = f"PyAV {av.__version__} is >= 19.0.0 and breaks faster-whisper"
     assert parsed < Version("19.0.0"), msg
@@ -15,6 +17,11 @@ def test_pyav_version_is_below_19():
 
 def test_faster_whisper_decode_audio_regression():
     """Regression test ensuring decode_audio does not fail with metadata_errors."""
+    pytest.importorskip("av")
+    pytest.importorskip("faster_whisper")
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg executable not found")
+
     from faster_whisper.audio import decode_audio
 
     # Generate a brief 1-second silence WAV with ffmpeg

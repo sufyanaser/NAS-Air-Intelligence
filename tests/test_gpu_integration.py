@@ -14,6 +14,7 @@ from nas_air_intelligence.transcription import (
 def _cuda_available() -> bool:
     try:
         import ctranslate2
+        import faster_whisper  # noqa: F401
 
         return ctranslate2.get_cuda_device_count() > 0
     except Exception:
