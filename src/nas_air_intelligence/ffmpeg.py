@@ -104,3 +104,48 @@ def silence_intervals(
         text=True,
     )
     return parse_silencedetect(proc.stderr, duration)
+
+
+def acoustic_fingerprint(
+    path: str | Path,
+    ffmpeg: str = "ffmpeg",
+    max_duration: float | None = None,
+) -> str | None:
+    """Generate Chromaprint acoustic fingerprint using FFmpeg's built-in chromaprint muxer.
+
+    Returns the Base64-encoded fingerprint string, or None if extraction failed or is unsupported.
+    """
+    try:
+        executable = find_binary(ffmpeg)
+    except ToolMissingError:
+        return None
+
+    cmd = [
+        executable,
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+    ]
+    if max_duration is not None and max_duration > 0:
+        cmd.extend(["-t", str(max_duration)])
+    cmd.extend(["-f", "chromaprint", "-fp_format", "base64", "-"])
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+
+    if proc.returncode != 0:
+        return None
+
+    fingerprint = proc.stdout.strip()
+    return fingerprint if fingerprint else None
+
