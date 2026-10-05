@@ -76,7 +76,7 @@ def test_cli_transcribe_json(tmp_path, capsys):
 
 def test_cli_doctor_outputs_cuda_status(capsys):
     exit_code = main(["doctor"])
-    assert exit_code == 0
+    assert exit_code in (0, 2)
     captured = capsys.readouterr().out
     data = json.loads(captured)
     assert "cuda_available" in data

@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -28,12 +29,15 @@ def test_transcription_config_defaults():
 
 def test_resolve_device_and_compute_auto():
     transcriber = SpeechTranscriber(TranscriptionConfig(device="auto", compute_type="auto"))
-    with patch("ctranslate2.get_cuda_device_count", return_value=1):
+    mock_c2 = MagicMock()
+    mock_c2.get_cuda_device_count.return_value = 1
+    with patch.dict(sys.modules, {"ctranslate2": mock_c2}):
         device, compute = transcriber._resolve_device_and_compute()
         assert device == "cuda"
         assert compute == "float16"
 
-    with patch("ctranslate2.get_cuda_device_count", return_value=0):
+    mock_c2.get_cuda_device_count.return_value = 0
+    with patch.dict(sys.modules, {"ctranslate2": mock_c2}):
         device, compute = transcriber._resolve_device_and_compute()
         assert device == "cpu"
         assert compute == "int8"
