@@ -41,6 +41,18 @@ def build_report(db: Database, session_id: str) -> dict[str, Any]:
             }
         )
 
+    speech_events = [e for e in events if e.get("kind") == "speech" or e.get("text")]
+    sample_transcripts = [
+        {
+            "start_offset": round(float(e["start_offset"]), 2),
+            "end_offset": round(float(e["end_offset"]), 2),
+            "confidence": e.get("confidence"),
+            "text": e.get("text"),
+        }
+        for e in speech_events
+        if e.get("text")
+    ][:20]
+
     return {
         "schema_version": 1,
         "session": {
@@ -67,6 +79,10 @@ def build_report(db: Database, session_id: str) -> dict[str, Any]:
             "classification_scope": (
                 "baseline silence/non-silent audio unless an optional analyzer was selected"
             ),
+            "speech_summary": {
+                "speech_events_count": len(speech_events),
+                "transcript_samples": sample_transcripts,
+            },
         },
         "incidents": incidents,
     }
@@ -99,6 +115,24 @@ def report_markdown(report: dict[str, Any]) -> str:
         )
     if not analysis["distribution"]:
         lines.append("| No analyzed events yet | 0 | 0 | 0% |")
+
+    speech_summary = analysis.get("speech_summary", {})
+    samples = speech_summary.get("transcript_samples", [])
+    if samples:
+        lines.extend(
+            [
+                "",
+                "## Speech intelligence samples",
+                "",
+                "| Offset (s) | Conf | Transcript |",
+                "| ---: | ---: | --- |",
+            ]
+        )
+        for item in samples[:10]:
+            conf = f"{item['confidence']:.2f}" if item["confidence"] is not None else "-"
+            offset = f"{item['start_offset']} - {item['end_offset']}"
+            lines.append(f"| {offset} | {conf} | {item['text']} |")
+
     lines.extend(
         [
             "",

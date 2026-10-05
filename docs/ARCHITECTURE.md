@@ -12,13 +12,28 @@ Completed chunks are probed with FFprobe, hashed with SHA-256, and stored in SQL
 
 ### Analyzer
 
-The baseline analyzer uses FFmpeg `silencedetect` and produces deterministic `silence` and `audio` events. It exists so the whole pipeline is testable without model downloads.
+The architecture supports layered analyzers:
 
-An ML adapter can later replace or enrich these events with speech/music/noise segmentation. Speech-only events can then be passed to ASR.
+1. `FfmpegSilenceAnalyzer`: deterministic baseline distinguishing silence from audio using FFmpeg `silencedetect`.
+2. `WhisperSpeechAnalyzer`: production speech intelligence adapter that generates timestamped `speech`, `silence`, and `unknown` events with transcripts, confidence scores, and acoustic fingerprints.
+3. `InaSpeechMusicAnalyzer`: optional ML adapter for speech/music segmentation (isolated for platforms where TensorFlow is supported).
+
+### Transcriber
+
+`transcription.py` implements `SpeechTranscriber` using `faster-whisper` and `ctranslate2`:
+
+- Default runtime: CUDA with `float16` compute type on NVIDIA GPUs (e.g. RTX 4070 SUPER).
+- Automatic CPU fallback: switches gracefully to CPU `int8`/`float32` if GPU execution fails.
+- Windows CUDA runtime resolution: dynamically locates `nvidia-cublas-cu12` and `nvidia-cudnn-cu12` DLL directories via `os.add_dll_directory`.
+- Dependency compatibility: constrained to `av<19` to prevent `metadata_errors` decode failure.
+
+### Acoustic Fingerprinter
+
+`ffmpeg.py` extracts Base64 Chromaprint acoustic fingerprints directly using FFmpeg's built-in chromaprint muxer (`-f chromaprint -fp_format base64`), avoiding external `fpcalc` binaries.
 
 ### Database
 
-SQLite is sufficient for the single-station MVP and makes the monitor portable on Windows. A migration to PostgreSQL is deferred until simultaneous multi-station monitoring makes it necessary.
+SQLite is sufficient for the single-station MVP and makes the monitor portable on Windows. The `events` table supports timestamps (`start_offset`, `end_offset`), category `kind`, `text` (transcripts), `fingerprint`, and JSON metadata.
 
 ### API
 

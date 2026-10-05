@@ -46,15 +46,16 @@ Long-duration monitoring is an infrastructure problem first. The recorder must s
 
 ## Requirements
 
-- Python 3.11+
-- FFmpeg and FFprobe available in `PATH`
+- Python 3.11+ (verified on 3.12.10)
+- FFmpeg (with chromaprint muxer enabled) and FFprobe in `PATH`
 - Windows, Linux, or macOS
+- Optional GPU: NVIDIA GPU with CUDA support (e.g. RTX 4070 SUPER, float16)
 
-Optional later-stage analysis:
+Speech transcription and ML dependencies:
 
-- `inaSpeechSegmenter` for speech/music segmentation
-- `faster-whisper` for speech transcription
-- Chromaprint/`fpcalc` for local acoustic fingerprints
+- `faster-whisper>=1.1.0` (with `av<19` compatibility constraint)
+- `ctranslate2` with CUDA float16 and automatic CPU fallback
+- Built-in FFmpeg chromaprint muxer for acoustic fingerprinting
 
 ## Setup
 
@@ -69,10 +70,11 @@ pip install -e ".[dev]"
 nas-air doctor
 ```
 
-For optional ML adapters:
+For GPU / ML speech transcription:
 
 ```bash
 pip install -e ".[ml,dev]"
+nas-air doctor
 ```
 
 ## First 24-hour monitor
@@ -121,8 +123,6 @@ Start the API:
 nas-air api --host 127.0.0.1 --port 8787
 ```
 
-Core endpoints:
-
 - `GET /health`
 - `GET /stations`
 - `GET /sessions`
@@ -130,18 +130,27 @@ Core endpoints:
 - `GET /sessions/{session_id}/timeline`
 - `GET /sessions/{session_id}/report`
 
-## Current classification scope
+## Speech transcription CLI
 
-The default analyzer intentionally distinguishes **silence** from **non-silent audio** only. That baseline is deterministic and does not require model downloads. The next analysis layer will add:
+Run speech transcription with GPU acceleration:
 
-- speech vs music segmentation;
-- short/recurrent audio candidate detection;
-- local acoustic fingerprints for station IDs/jingles;
-- ASR only on speech intervals;
-- music-recognition provider integration;
-- clock-pattern analysis across 24 hours.
+```bash
+nas-air transcribe audio.mp3 --language ar --model tiny
+```
 
-This staged approach avoids pretending that speech/music/jingle recognition is reliable before the model layer has actually been installed and validated on Iraqi radio material.
+Output formatted JSON:
+
+```bash
+nas-air transcribe audio.mp3 --language ar --json
+```
+
+## Pipeline concepts & classification policy
+
+1. **Transcription**: Converts speech segments into text with timestamps and confidence scores.
+2. **Segmentation**: Divides audio into intervals (`speech`, `silence`, `unknown`).
+3. **Classification policy**: Conservative and evidence-based (`speech`, `silence`, `unknown`, `likely_*`). Unknown is always preferred over speculative claims (no fake ads, jingles, or music labels).
+4. **Acoustic fingerprinting**: Extracted directly using FFmpeg Chromaprint (`-f chromaprint -fp_format base64`) for broadcast timeline alignment.
+5. **Session resilience**: Transcription or analysis errors on individual chunks never terminate a monitoring session; failures are recorded as structured incidents and preserved in the event timeline.
 
 ## Data policy
 

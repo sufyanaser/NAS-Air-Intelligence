@@ -16,6 +16,10 @@ reports/
 *.db
 *.sqlite
 *.sqlite3
+*.wav
+*.mp3
+*.m4a
+*.log
 
 # Environment
 .env
