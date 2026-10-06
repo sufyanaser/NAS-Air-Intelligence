@@ -49,6 +49,54 @@ def _stop_ffmpeg(process: subprocess.Popen) -> None:
         process.wait(timeout=5)
 
 
+PID_FILE = "ffmpeg.pid"
+
+
+def _is_ffmpeg_process(pid: int) -> bool:
+    """True only if ``pid`` is alive and is an ffmpeg process (guards against PID reuse)."""
+    try:
+        if os.name == "nt":
+            out = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout  # fmt: skip
+        else:
+            out = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "comm="],
+                capture_output=True, text=True, timeout=10, check=False,
+            ).stdout  # fmt: skip
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return "ffmpeg" in out.lower()
+
+
+def reap_orphan_ffmpeg(output_dir: Path) -> int | None:
+    """Kill an ffmpeg left running after its worker died; returns the PID it killed, if any.
+
+    Child processes are not terminated with their parent on Windows, so a lost worker leaves
+    ffmpeg recording into the session directory with nobody indexing the chunks.
+    """
+    pid_file = output_dir / PID_FILE
+    try:
+        pid = int(pid_file.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    killed: int | None = None
+    if _is_ffmpeg_process(pid):
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, timeout=15, check=False,
+            )  # fmt: skip
+        else:
+            import signal
+
+            os.kill(pid, signal.SIGTERM)
+        killed = pid
+    pid_file.unlink(missing_ok=True)
+    return killed
+
+
 def _is_stable(path: Path, minimum_age_seconds: float = 1.5) -> bool:
     return (time.time() - path.stat().st_mtime) >= minimum_age_seconds
 
@@ -196,6 +244,7 @@ class StreamMonitor:
                         text=True,
                         env=os.environ.copy(),
                     )
+                    (output_dir / PID_FILE).write_text(str(process.pid), encoding="utf-8")
                     while process.poll() is None:
                         self._index_new_chunks(session_id, output_dir, seen, include_newest=False)
                         if self.analyzer:
@@ -205,6 +254,7 @@ class StreamMonitor:
                             break
                         time.sleep(2.0)
 
+                (output_dir / PID_FILE).unlink(missing_ok=True)
                 self._index_new_chunks(session_id, output_dir, seen, include_newest=True)
                 if self.analyzer:
                     analyze_pending_chunks(self.db, session_id, self.analyzer)
