@@ -487,3 +487,212 @@ def test_result_for_plain_monitor_session(tmp_path: Path, capsys):
     assert main(["--db", db_path, "agent", "result", session_id]) == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["session_id"] == session_id and payload["timeline_head"]
+
+
+# ------------------------------------------------- coverage, completion, language, recurrence
+
+
+def test_timeline_covers_captured_audio_even_with_sparse_events():
+    """The 2h validation had ~27% of airtime with no explicit event; it must show as unknown."""
+    chunks = [_chunk(f"c{i}", T0 + timedelta(seconds=60 * i), 60.0) for i in range(5)]
+    events = [
+        _event(f"e{i}", f"c{i}", "speech", 0.0, 44.0, confidence=0.8, text="t") for i in range(5)
+    ]
+    segments = build_timeline(chunks, events)
+    covered = sum(s.duration_seconds for s in segments if s.kind != "capture_gap")
+    assert covered == pytest.approx(300.0, abs=0.01)
+    unknown = sum(s.duration_seconds for s in segments if s.kind == "unknown_audio")
+    assert unknown == pytest.approx(5 * 16.0, abs=0.01)
+    assert not any(s.kind == "music" for s in segments)
+
+
+def test_report_metrics_and_language_and_recurrence_status(tmp_path: Path):
+    db, store, run_id = _setup(tmp_path)
+    _agent(db, store, run_id, tmp_path, FakeMonitor(db)).run()
+    run = store.get(run_id)
+    report, _, md_path, _ = write_agent_report(
+        db, run["session_id"], tmp_path / "r", requested_seconds=120, run=run
+    )
+    metrics = report["summary_metrics"]
+    assert metrics["timeline_coverage_of_captured"] == pytest.approx(1.0, abs=0.01)
+    assert metrics["speech_seconds"] + metrics["silence_seconds"] + metrics["unknown_seconds"] == (
+        pytest.approx(metrics["captured_seconds"], abs=0.5)
+    )
+    rec = report["recurrent_audio_candidates"]
+    assert rec["recurrent_audio_detection"] == "NOT VERIFIED"
+    assert rec["acoustic_fingerprint_primitive"] == "READY"
+    text = md_path.read_text(encoding="utf-8")
+    assert "Key Metrics" in text and "NOT VERIFIED" in text
+
+
+def _speech_event(meta: dict[str, Any]) -> dict[str, Any]:
+    return {"kind": "speech", "text": "x", "confidence": 0.8, "start_offset": 0,
+            "end_offset": 1, "metadata": meta}  # fmt: skip
+
+
+def test_language_reporting_forced_auto_and_legacy():
+    from nas_air_intelligence.agent.report import _language_reporting
+
+    forced = _language_reporting(
+        [
+            _speech_event(
+                {"language": "ar", "configured_language": "ar", "language_probability": 1.0}
+            )
+        ]
+    )
+    assert forced["configured_language"] == "ar"
+    assert "language_probability" not in json.dumps(forced)
+    assert "forced" in forced["language_detection"]
+
+    auto = _language_reporting(
+        [
+            _speech_event(
+                {"language": "ar", "configured_language": None, "language_probability": 0.9}
+            )
+        ]
+    )
+    assert auto["detected_language"] == "ar" and auto["language_probability_mean"] == 0.9
+
+    legacy = _language_reporting([_speech_event({"language": "ar", "language_probability": 1.0})])
+    assert legacy["configured_language"] is None
+    assert "language_probability_mean" not in legacy and "predate" in legacy["language_detection"]
+
+
+def _run_recorder_with_clean_exits(tmp_path: Path, monkeypatch, duration: float):
+    from nas_air_intelligence import recorder
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, *a, **k):
+            pass
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(recorder, "find_binary", lambda name: name)
+    monkeypatch.setattr(recorder.subprocess, "Popen", FakeProc)
+    db = Database(tmp_path / "rec.db")
+    station = db.upsert_station("S", "https://s/x")
+    monitor = recorder.StreamMonitor(db, storage_dir=tmp_path / "d", reconnect_delay=0.01)
+    session_id = monitor.run(station, duration, 10)
+    return db, session_id
+
+
+def test_normal_ffmpeg_completion_is_not_an_incident(tmp_path: Path, monkeypatch):
+    db, session_id = _run_recorder_with_clean_exits(tmp_path, monkeypatch, duration=3.0)
+    assert db.session(session_id)["status"] == "completed"
+    assert [i for i in db.incidents(session_id) if i["kind"] == "ffmpeg_exit"] == []
+
+
+def test_early_clean_exit_is_still_an_incident(tmp_path: Path, monkeypatch):
+    # 25s requested but ffmpeg "exits cleanly" at once: the stream ended early -> incident.
+    from nas_air_intelligence import recorder
+
+    monkeypatch.setattr(recorder, "GRACEFUL_END_TOLERANCE_SECONDS", 10.0)
+    calls = {"n": 0}
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, *a, **k):
+            calls["n"] += 1
+
+        def poll(self):
+            return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(recorder, "find_binary", lambda name: name)
+    monkeypatch.setattr(recorder.subprocess, "Popen", FakeProc)
+    db = Database(tmp_path / "rec2.db")
+    station = db.upsert_station("S", "https://s/x")
+    monitor = recorder.StreamMonitor(db, storage_dir=tmp_path / "d", reconnect_delay=0.01)
+    session_id = monitor.run(station, 12.0, 10)
+    assert any(i["kind"] == "ffmpeg_exit" for i in db.incidents(session_id))
+    assert calls["n"] >= 2  # reconnected
+
+
+def test_resolver_finds_stream_hidden_in_late_js_chunk():
+    """Regression from the real al-nakhla.net page (Next.js): the URL is in new Audio(...)."""
+    page = "https://station.example/ar/radio"
+    scripts = [f"/_next/static/chunks/{i}-abc.js" for i in range(8)]
+    html = "".join(f'<script src="{s}"></script>' for s in scripts)
+    html += '<a href="https://alt.invalid/ar/radio">alt</a>'
+    pages = {page: html, **{f"https://station.example{s}": "var x=1;" for s in scripts}}
+    pages["https://station.example" + scripts[7]] = (
+        'useEffect(()=>{let e=new Audio("https://a4.example.net:6970/radio.mp3");})'
+    )
+    resolver = _resolver(pages, {"https://a4.example.net:6970/radio.mp3"})
+    resolved = resolver.resolve("Station", page=page)
+    assert resolved.verification_status == "verified"
+    assert resolved.resolved_stream_url == "https://a4.example.net:6970/radio.mp3"
+    assert resolved.details["attempts"][0]["origin"] == "js-audio"  # tried before page links
+
+
+def test_stop_ffmpeg_asks_politely_then_kills_as_fallback():
+    import subprocess as sp
+
+    from nas_air_intelligence.recorder import _stop_ffmpeg
+
+    class Stdin:
+        data = ""
+
+        def write(self, text):
+            self.data += text
+
+        def flush(self):
+            pass
+
+    class Polite:
+        stdin = Stdin()
+        terminated = False
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            self.terminated = True
+
+    polite = Polite()
+    _stop_ffmpeg(polite)
+    assert polite.stdin.data == "q\n" and not polite.terminated
+
+    class Stubborn(Polite):
+        stdin = Stdin()
+        calls = 0
+        killed = False
+
+        def wait(self, timeout=None):
+            self.calls += 1
+            if self.calls <= 2:
+                raise sp.TimeoutExpired("ffmpeg", timeout)
+            return 0
+
+        def kill(self):
+            self.killed = True
+
+    stubborn = Stubborn()
+    _stop_ffmpeg(stubborn)
+    assert stubborn.terminated and stubborn.killed
+
+
+def test_excerpts_skip_duplicates_and_repetitive_hallucinations():
+    from nas_air_intelligence.agent.report import _speech_intelligence
+
+    def ev(text, conf):
+        return {"kind": "speech", "text": text, "confidence": conf, "start_offset": 0,
+                "end_offset": 1, "metadata": {}}  # fmt: skip
+
+    events = [
+        ev("la la la la la", 0.99),
+        ev("good morning listeners", 0.8),
+        ev("good morning listeners", 0.8),
+        ev("traffic is heavy downtown", 0.7),
+    ]
+    texts = [e["text"] for e in _speech_intelligence(events)["excerpts"]]
+    assert texts == ["good morning listeners", "traffic is heavy downtown"]

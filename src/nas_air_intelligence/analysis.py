@@ -77,6 +77,7 @@ class WhisperSpeechAnalyzer:
         result, error = self.transcriber.transcribe_safe(path)
 
         events: list[dict[str, Any]] = []
+        configured_language = getattr(getattr(self.transcriber, "config", None), "language", None)
 
         if error:
             # Transcription failure recorded as structured unknown event with incident status
@@ -113,6 +114,7 @@ class WhisperSpeechAnalyzer:
                         "fingerprint": fp,
                         "metadata": {
                             "language": result.language,
+                            "configured_language": configured_language,
                             "language_probability": result.language_probability,
                             "avg_logprob": seg.avg_logprob,
                             "no_speech_prob": seg.no_speech_prob,

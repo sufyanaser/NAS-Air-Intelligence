@@ -23,7 +23,7 @@ from ..ffmpeg import find_binary
 from ..util import isoformat, utc_now
 
 USER_AGENT = "Mozilla/5.0 (compatible; NASAirMonitor/0.1; +official-stream-discovery)"
-MAX_PAGE_FETCHES = 8
+MAX_PAGE_FETCHES = 16
 MAX_FETCH_BYTES = 1_500_000
 
 _AUDIO_EXTENSIONS = (".mp3", ".aac", ".m3u8", ".pls", ".m3u", ".ogg", ".opus", ".m4a")
@@ -36,6 +36,8 @@ _BLOCKED_HOSTS = (
     "google.com", "googleapis.com", "gstatic.com", "w3.org", "schema.org",
 )  # fmt: skip
 _URL_RE = re.compile(r"""https?:(?:\\?/){2}[^\s"'<>)\]\\]+(?:\\/[^\s"'<>)\]\\]*)*""")
+_JS_AUDIO_RE = re.compile(r"""new\s+Audio\(\s*["']([^"']+)["']""")
+_SCRIPT_PRIORITY = ("layout", "radio", "player", "audio", "stream", "page", "app")
 _STREAMISH_PATH = re.compile(r"/(stream|live|radio|listen|audio|icecast|shoutcast)\b|;stream", re.I)
 
 
@@ -128,7 +130,8 @@ def extract_candidates(text: str, base_url: str | None = None) -> list[Candidate
         url = _clean_url(raw.strip())
         if base_url:
             url = urljoin(base_url, url)
-        if not _looks_streamish(url) and not (origin == "tag" and url.startswith("http")):
+        trusted = origin in {"tag", "js-audio"} and url.startswith("http")
+        if not _looks_streamish(url) and not trusted:
             return
         path = urlparse(url).path.lower()
         score = bonus
@@ -136,7 +139,8 @@ def extract_candidates(text: str, base_url: str | None = None) -> list[Candidate
             score += 2
         elif path.endswith(_AUDIO_EXTENSIONS):
             score += 1
-        if any(word in url.lower() for word in ("radio", "stream", "live")):
+        has_audio_ext = path.endswith(_AUDIO_EXTENSIONS)
+        if has_audio_ext and any(word in url.lower() for word in ("radio", "stream", "live")):
             score += 1
         existing = found.get(url)
         if existing is None or existing.score < score:
@@ -147,6 +151,8 @@ def extract_candidates(text: str, base_url: str | None = None) -> list[Candidate
         parser.feed(text)
     for src in parser.media:
         add(src, "tag", 3)
+    for match in _JS_AUDIO_RE.finditer(text):
+        add(match.group(1), "js-audio", 4)
     for match in _URL_RE.finditer(text):
         add(match.group(0), "text", 0)
     return sorted(found.values(), key=lambda c: (-c.score, c.url))
@@ -156,7 +162,15 @@ def script_references(html: str, page_url: str) -> list[str]:
     parser = _MediaTagParser()
     with contextlib.suppress(Exception):
         parser.feed(html)
-    return [urljoin(page_url, s) for s in parser.scripts]
+    refs = [urljoin(page_url, s) for s in parser.scripts]
+    # Framework bundles hide the player config in layout/page chunks: fetch those first.
+    return sorted(
+        refs,
+        key=lambda r: min(
+            (i for i, word in enumerate(_SCRIPT_PRIORITY) if word in r.lower()),
+            default=len(_SCRIPT_PRIORITY),
+        ),
+    )
 
 
 def api_references(text: str, page_url: str) -> list[str]:
@@ -308,7 +322,7 @@ class StreamResolver:
         """Ordered stream candidates found on a station page (never verified here)."""
         html, _ = self.fetch(page_url)
         candidates: dict[str, Candidate] = {c.url: c for c in extract_candidates(html, page_url)}
-        pending = script_references(html, page_url)[:5]
+        pending = script_references(html, page_url)[:14]
         fetches = 1
         while pending and fetches < MAX_PAGE_FETCHES:
             ref = pending.pop(0)
