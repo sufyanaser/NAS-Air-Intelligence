@@ -10,14 +10,17 @@ from pathlib import Path
 from typing import Any
 
 from ..db import Database
+from .excel_export import write_workbook
 from .launcher import (
     create_and_launch_run,
     describe,
     live_metrics,
     live_timeline,
     request_stop,
+    resolve_session_for_study,
 )
 from .orchestrator import MonitoringAgent
+from .programming import build_programming_analysis
 from .report import build_agent_report
 from .store import AgentStore
 
@@ -36,6 +39,12 @@ def _print(payload: Any) -> None:
 
 def _find_run(store: AgentStore, ident: str) -> dict[str, Any] | None:
     return store.find(ident)
+
+
+def _resolve_session(
+    db: Database, store: AgentStore, ident: str
+) -> tuple[str, float, dict[str, Any] | None]:
+    return resolve_session_for_study(store, db, ident)
 
 
 def command_start(args: argparse.Namespace) -> int:
@@ -146,6 +155,28 @@ def command_journal(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_programming(args: argparse.Namespace) -> int:
+    db = Database(_db_path(args))
+    store = AgentStore(db)
+    session_id, _requested, run = _resolve_session(db, store, args.run)
+    result = build_programming_analysis(db, session_id)
+    _print({"run_id": run["id"] if run else None, **result})
+    return 0
+
+
+def command_export(args: argparse.Namespace) -> int:
+    db = Database(_db_path(args))
+    store = AgentStore(db)
+    session_id, requested_seconds, run = _resolve_session(db, store, args.run)
+    storage = _storage(args)
+    path = write_workbook(
+        db, session_id, Path(storage) / "exports",
+        requested_seconds=requested_seconds, run=run,
+    )  # fmt: skip
+    _print({"run_id": run["id"] if run else None, "session_id": session_id, "xlsx": str(path)})
+    return 0
+
+
 def command_worker(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     db = Database(_db_path(args))
@@ -198,6 +229,18 @@ def register(sub: Any) -> None:
     journal = asub.add_parser("journal", help="Agent Run Journal (activity feed events)")
     journal.add_argument("run", help="agent run id")
     journal.set_defaults(func=command_journal)
+
+    programming = asub.add_parser(
+        "programming", help="Programming Intelligence: content blocks, candidates, "
+        "clock patterns, dayparts, insights"
+    )  # fmt: skip
+    programming.add_argument("run", help="agent run id or any monitor session id")
+    programming.set_defaults(func=command_programming)
+
+    export = asub.add_parser("export", help="write the 8-sheet Excel study workbook")
+    export.add_argument("run", help="agent run id or any monitor session id")
+    export.add_argument("--storage")
+    export.set_defaults(func=command_export)
 
     worker = asub.add_parser("_run")
     worker.add_argument("run_id")

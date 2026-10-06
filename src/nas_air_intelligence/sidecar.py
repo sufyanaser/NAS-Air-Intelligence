@@ -17,6 +17,8 @@ state the CLI uses, so closing the desktop or losing this sidecar never stops a 
     GET  /agent/{id}/result
     GET  /agent/{id}/timeline
     GET  /agent/{id}/journal     (Agent Run Journal - the desktop activity feed)
+    GET  /agent/{id}/programming (Phase 5: content blocks, candidates, clock patterns, dayparts)
+    POST /agent/{id}/export/xlsx (Phase 6: 8-sheet study workbook; runs in a background thread)
     WS   /agent/{id}/events      notification-only; persistent backend state is authoritative
 """
 
@@ -41,12 +43,14 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .agent.excel_export import write_workbook
 from .agent.launcher import (
     create_and_launch_run,
     describe,
     live_timeline,
     request_stop,
 )
+from .agent.programming import build_programming_analysis
 from .agent.store import AgentStore
 from .db import Database
 
@@ -201,12 +205,53 @@ def _route_agent_journal(handler: _Handler, match: re.Match[str]) -> None:
     handler._send(200, {"run_id": run["id"], "events": server.store.events(run["id"])})
 
 
+def _route_agent_programming(handler: _Handler, match: re.Match[str]) -> None:
+    server = handler.server
+    run = _run_or_404(server, match.group(1))
+    if not run.get("session_id"):
+        raise ApiError(409, "run has not started capturing yet")
+    analysis = build_programming_analysis(server.db, run["session_id"])
+    handler._send(200, {"run_id": run["id"], **analysis})
+
+
+def _route_agent_export(handler: _Handler, match: re.Match[str]) -> None:
+    """Kicks off the xlsx export in a background thread and returns immediately (Phase2.md
+    section 20: "Excel generation runs in the background"). Completion and failure both show
+    up as an Agent Run Journal entry - the desktop polls/watches that, not this response."""
+    server = handler.server
+    run = _run_or_404(server, match.group(1))
+    if not run.get("session_id"):
+        raise ApiError(409, "run has not started capturing yet")
+    export_dir = Path(server.storage) / "exports"
+
+    def _do_export() -> None:
+        try:
+            path = write_workbook(
+                server.db, run["session_id"], export_dir,
+                requested_seconds=float(run["duration_seconds"]), run=run,
+            )  # fmt: skip
+            server.store.log_event(
+                run["id"], stage=run["state"], event_type="EXPORT_CREATED",
+                message=str(path), details={"xlsx": str(path)},
+            )  # fmt: skip
+        except Exception as exc:
+            logger.exception("excel export failed for run %s", run["id"])
+            server.store.log_event(
+                run["id"], stage=run["state"], event_type="EXPORT_FAILED",
+                status="failed", severity="error", message=str(exc),
+            )  # fmt: skip
+
+    threading.Thread(target=_do_export, daemon=True, name="xlsx-export").start()
+    handler._send(202, {"run_id": run["id"], "status": "started", "export_dir": str(export_dir)})
+
+
 _GET_ROUTES: list[tuple[re.Pattern[str], Any]] = [
     (re.compile(r"^/health$"), _route_health),
     (re.compile(rf"^/agent/({_RUN_ID})/status$"), _route_agent_status),
     (re.compile(rf"^/agent/({_RUN_ID})/result$"), _route_agent_result),
     (re.compile(rf"^/agent/({_RUN_ID})/timeline$"), _route_agent_timeline),
     (re.compile(rf"^/agent/({_RUN_ID})/journal$"), _route_agent_journal),
+    (re.compile(rf"^/agent/({_RUN_ID})/programming$"), _route_agent_programming),
 ]
 _WS_ROUTES: list[tuple[re.Pattern[str], Any]] = [
     (re.compile(rf"^/agent/({_RUN_ID})/events$"), None),  # handled by _maybe_handle_ws_upgrade
@@ -215,6 +260,7 @@ _POST_ROUTES: list[tuple[re.Pattern[str], Any]] = [
     (re.compile(r"^/shutdown$"), _route_shutdown),
     (re.compile(r"^/agent/start$"), _route_agent_start),
     (re.compile(rf"^/agent/({_RUN_ID})/stop$"), _route_agent_stop),
+    (re.compile(rf"^/agent/({_RUN_ID})/export/xlsx$"), _route_agent_export),
 ]
 
 

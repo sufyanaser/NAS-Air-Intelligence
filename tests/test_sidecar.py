@@ -201,6 +201,69 @@ def test_agent_status_stop_result_journal_timeline_round_trip(server, no_real_wo
     assert err.value.code == 404
 
 
+def test_agent_programming_and_export_require_a_started_session(server, no_real_worker):
+    port = server.server_address[1]
+    run_id = _start(server, no_real_worker)["run_id"]
+    with pytest.raises(urllib.error.HTTPError) as err:
+        _get(port, f"/agent/{run_id}/programming")
+    assert err.value.code == 409
+    with pytest.raises(urllib.error.HTTPError) as err:
+        _get(port, f"/agent/{run_id}/export/xlsx", method="POST")
+    assert err.value.code == 409
+
+
+def _attach_real_session(server, run_id: str) -> str:
+    """Gives a started run a real session with chunks+events, as capture would."""
+    station = server.db.upsert_station("Test FM", "https://s/live.mp3")
+    session_id = server.db.create_session(station, 3600.0, 300, "x")
+    chunk_id = server.db.add_chunk(
+        session_id, "/tmp/c1.mp3", "2026-01-05T10:00:00Z", "2026-01-05T10:05:00Z", 300.0, "sha1"
+    )
+    server.db.add_events([
+        {"id": "e1", "session_id": session_id, "chunk_id": chunk_id, "kind": "speech",
+         "start_offset": 0.0, "end_offset": 200.0, "confidence": 0.8, "text": "hello",
+         "fingerprint": None, "metadata": {}},
+    ])  # fmt: skip
+    server.db.finish_session(session_id, "completed")
+    server.store.update(run_id, session_id=session_id)
+    return session_id
+
+
+def test_agent_programming_route_returns_study_summary(server, no_real_worker):
+    port = server.server_address[1]
+    run_id = _start(server, no_real_worker)["run_id"]
+    _attach_real_session(server, run_id)
+    with _get(port, f"/agent/{run_id}/programming") as resp:
+        body = json.loads(resp.read())
+    assert body["run_id"] == run_id
+    assert body["study_summary"]["content_block_count"] >= 1
+    assert all("confidence" in b for b in body["content_blocks"])
+
+
+def test_agent_export_route_runs_in_background_and_writes_a_real_xlsx(server, no_real_worker):
+    import time
+
+    port = server.server_address[1]
+    run_id = _start(server, no_real_worker)["run_id"]
+    _attach_real_session(server, run_id)
+
+    with _get(port, f"/agent/{run_id}/export/xlsx", method="POST") as resp:
+        assert resp.status == 202
+        ack = json.loads(resp.read())
+    assert ack["status"] == "started" and ack["run_id"] == run_id
+
+    export_dir = Path(ack["export_dir"])
+    deadline = time.monotonic() + 10
+    journal: list[dict] = []
+    while time.monotonic() < deadline:
+        journal = server.store.events(run_id)
+        if any(e["event_type"] in ("EXPORT_CREATED", "EXPORT_FAILED") for e in journal):
+            break
+        time.sleep(0.05)
+    assert any(e["event_type"] == "EXPORT_CREATED" for e in journal), journal
+    assert export_dir.is_dir() and list(export_dir.glob("*.xlsx"))
+
+
 # ------------------------------------------------------------------------------ WebSocket
 def test_agent_events_websocket_notifies_on_change_and_closes_on_terminal_state(
     server, no_real_worker
