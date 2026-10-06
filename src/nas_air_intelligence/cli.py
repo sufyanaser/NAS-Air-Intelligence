@@ -7,6 +7,7 @@ import shutil
 import sys
 from pathlib import Path
 
+from .agent.cli import register as register_agent
 from .analysis import (
     FfmpegSilenceAnalyzer,
     InaSpeechMusicAnalyzer,
@@ -239,6 +240,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="output structured JSON",
     )
     transcribe.set_defaults(func=command_transcribe)
+
+    register_agent(sub)
 
     return parser
 

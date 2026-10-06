@@ -152,6 +152,27 @@ nas-air transcribe audio.mp3 --language ar --json
 4. **Acoustic fingerprinting**: Extracted directly using FFmpeg Chromaprint (`-f chromaprint -fp_format base64`) for broadcast timeline alignment.
 5. **Session resilience**: Transcription or analysis errors on individual chunks never terminate a monitoring session; failures are recorded as structured incidents and preserved in the event timeline.
 
+## Monitoring Agent (one station, one session)
+
+The agent resolves/verifies a stream, runs capture in the background, analyzes completed
+chunks in a separate consumer thread (capture never waits for Whisper), builds an
+absolute-time timeline, evaluates quality gates, and writes a structured report.
+
+```bash
+nas-air agent start --station "Al Nakhla FM" --page "https://www.al-nakhla.net/ar/radio" --mode smoke
+nas-air agent start --name "Al Nakhla FM" --url "<stream>" --duration 2h
+nas-air agent status [run-id]      # live state, chunks, backlog, incidents
+nas-air agent stop <run-id>        # graceful stop; also recovers a lost worker
+nas-air agent result <run-id|session-id>
+```
+
+- States: CREATED, RESOLVING_STREAM, VERIFYING_STREAM, READY, CAPTURING, PROCESSING,
+  FINALIZING, REPORTING, then COMPLETED / COMPLETED_WITH_WARNINGS / STREAM_UNAVAILABLE /
+  CAPTURE_FAILED / FAILED. Partial analysis failure never discards captured audio.
+- The worker is a detached process (`data/logs/agent-*.log`); closing the terminal does not stop it.
+- Reports: `data/reports/<session-id>.agent.json` and `.agent.md`.
+- Run state lives in the `agent_runs` table of the same SQLite file.
+
 ## Data policy
 
 For monitored third-party stations, the project is intended for broadcast analysis and structured metadata. Reports should summarize programming structure and use only short excerpts where needed; they should not reproduce long copyrighted scripts or distribute captured music.
