@@ -400,6 +400,41 @@ def test_recovery_after_worker_loss(tmp_path: Path):
     assert Path(run["result"]["report_json"]).exists()
 
 
+def _sleeper():
+    import subprocess
+    import sys
+
+    return subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+
+
+def test_reap_orphan_ffmpeg_kills_process_and_clears_pid_file(tmp_path: Path, monkeypatch):
+    from nas_air_intelligence import recorder
+
+    monkeypatch.setattr(recorder, "_is_ffmpeg_process", lambda pid: True)
+    proc = _sleeper()
+    try:
+        (tmp_path / recorder.PID_FILE).write_text(str(proc.pid), encoding="utf-8")
+        assert recorder.reap_orphan_ffmpeg(tmp_path) == proc.pid
+        assert proc.wait(timeout=15) is not None
+        assert not (tmp_path / recorder.PID_FILE).exists()
+    finally:
+        proc.kill()
+
+
+def test_reap_orphan_ffmpeg_ignores_non_ffmpeg_pid_and_missing_file(tmp_path: Path, monkeypatch):
+    from nas_air_intelligence import recorder
+
+    assert recorder.reap_orphan_ffmpeg(tmp_path) is None  # no pid file
+    monkeypatch.setattr(recorder, "_is_ffmpeg_process", lambda pid: False)
+    proc = _sleeper()
+    try:
+        (tmp_path / recorder.PID_FILE).write_text(str(proc.pid), encoding="utf-8")
+        assert recorder.reap_orphan_ffmpeg(tmp_path) is None  # PID reused by another program
+        assert proc.poll() is None  # untouched
+    finally:
+        proc.kill()
+
+
 # ------------------------------------------------------------------------------ report
 
 
@@ -563,6 +598,7 @@ def _run_recorder_with_clean_exits(tmp_path: Path, monkeypatch, duration: float)
 
     class FakeProc:
         returncode = 0
+        pid = 4242
 
         def __init__(self, *a, **k):
             pass
@@ -597,6 +633,7 @@ def test_early_clean_exit_is_still_an_incident(tmp_path: Path, monkeypatch):
 
     class FakeProc:
         returncode = 0
+        pid = 4242
 
         def __init__(self, *a, **k):
             calls["n"] += 1
