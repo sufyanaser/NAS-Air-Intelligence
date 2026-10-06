@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -87,6 +89,9 @@ class StreamMonitor:
         station_id: str,
         duration_seconds: float,
         segment_seconds: int = 300,
+        *,
+        stop_event: threading.Event | None = None,
+        on_session: Callable[[str], None] | None = None,
     ) -> str:
         if segment_seconds < 10:
             raise ValueError("segment_seconds must be at least 10")
@@ -107,6 +112,8 @@ class StreamMonitor:
         )
         output_dir = session_root / session_id
         output_dir.mkdir(parents=True, exist_ok=True)
+        if on_session:
+            on_session(session_id)
         with self.db.connect() as conn:
             conn.execute(
                 "UPDATE sessions SET output_dir=? WHERE id=?",
@@ -173,7 +180,7 @@ class StreamMonitor:
                         )
                         if self.analyzer:
                             analyze_pending_chunks(self.db, session_id, self.analyzer)
-                        if time.monotonic() >= deadline:
+                        if time.monotonic() >= deadline or (stop_event and stop_event.is_set()):
                             process.terminate()
                             try:
                                 process.wait(timeout=5)
@@ -189,7 +196,7 @@ class StreamMonitor:
 
                 next_segment_number = len(_completed_audio_files(output_dir))
                 remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                if remaining <= 0 or (stop_event and stop_event.is_set()):
                     break
                 stderr_lines = attempt_log.read_text(
                     encoding="utf-8", errors="replace"
@@ -207,7 +214,11 @@ class StreamMonitor:
             self._index_new_chunks(session_id, output_dir, seen)
             if self.analyzer:
                 analyze_pending_chunks(self.db, session_id, self.analyzer)
-            self.db.finish_session(session_id, "completed")
+            if stop_event and stop_event.is_set():
+                self.db.add_incident(session_id, "manual_stop", "stop requested")
+                self.db.finish_session(session_id, "stopped")
+            else:
+                self.db.finish_session(session_id, "completed")
         except KeyboardInterrupt:
             self.db.add_incident(session_id, "manual_stop", "monitor interrupted by operator")
             self.db.finish_session(session_id, "stopped")

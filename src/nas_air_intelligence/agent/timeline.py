@@ -1,0 +1,243 @@
+"""Unified wall-clock timeline built from chunk timestamps plus per-chunk event offsets.
+
+Classification policy: every segment carries a tier. ``Detected`` is a measured fact
+(silencedetect, a capture gap, transcribed speech with usable confidence), ``Likely`` is a
+model output with weak support, and ``Unknown`` is everything else. Non-speech audio is
+never promoted to music/jingle/ad.
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from typing import Any
+
+from ..util import isoformat, parse_iso
+
+GAP_TOLERANCE_SECONDS = 3.0
+SPEECH_DETECTED_CONFIDENCE = 0.4
+MIN_SEGMENT_SECONDS = 0.5
+_EPS = 1e-6
+
+# Kinds written by analyzers that mean "non-silent audio nobody classified".
+_UNCLASSIFIED = {"audio", "unknown", "unknown_audio"}
+_PRIORITY = {"silence": 3, "speech": 2}
+
+
+@dataclass
+class TimelineSegment:
+    start: datetime
+    end: datetime
+    kind: str
+    tier: str
+    event_count: int = 0
+    mean_confidence: float | None = None
+
+    @property
+    def duration_seconds(self) -> float:
+        return (self.end - self.start).total_seconds()
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["start"] = isoformat(self.start)
+        data["end"] = isoformat(self.end)
+        data["duration_seconds"] = round(self.duration_seconds, 3)
+        if self.mean_confidence is not None:
+            data["mean_confidence"] = round(self.mean_confidence, 3)
+        return data
+
+
+def normalize_kind(kind: str) -> str:
+    return "unknown_audio" if kind in _UNCLASSIFIED else kind
+
+
+def _tier(kind: str, confidence: float | None) -> str:
+    if kind in {"silence", "capture_gap"}:
+        return "Detected"
+    if kind == "speech":
+        if confidence is not None and confidence >= SPEECH_DETECTED_CONFIDENCE:
+            return "Detected"
+        return "Likely"
+    if kind == "unknown_audio":
+        return "Unknown"
+    return "Likely"  # model-derived classes such as music/noise from an ML adapter
+
+
+def station_timezone(name: str | None) -> tzinfo:
+    try:
+        from zoneinfo import ZoneInfo
+
+        return ZoneInfo(name or "UTC")
+    except Exception:
+        return timezone(timedelta(hours=3)) if name == "Asia/Baghdad" else UTC
+
+
+def _chunk_segments(chunk: dict[str, Any], events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Elementary (kind, start, end, event ids, confidences) intervals for one chunk."""
+    duration = float(chunk["duration_seconds"])
+    clipped = []
+    for event in events:
+        start = max(0.0, min(duration, float(event["start_offset"])))
+        end = max(0.0, min(duration, float(event["end_offset"])))
+        if end - start > _EPS:
+            clipped.append((start, end, normalize_kind(event["kind"]), event))
+    points = {0.0, duration}
+    for start, end, _, _ in clipped:
+        points.update((start, end))
+    ordered = sorted(points)
+    pieces = []
+    for a, b in zip(ordered, ordered[1:], strict=False):
+        if b - a <= _EPS:
+            continue
+        mid = (a + b) / 2.0
+        covering = [c for c in clipped if c[0] <= mid < c[1]]
+        if covering:
+            best = max(covering, key=lambda c: _PRIORITY.get(c[2], 1))
+            kind = best[2]
+            used = [c[3] for c in covering if c[2] == kind]
+        else:
+            kind, used = "unknown_audio", []
+        pieces.append(
+            {
+                "kind": kind,
+                "start": a,
+                "end": b,
+                "ids": {e["id"] for e in used},
+                "conf": [float(e["confidence"]) for e in used if e.get("confidence") is not None],
+            }
+        )
+    return pieces
+
+
+def build_timeline(
+    chunks: list[dict[str, Any]], events: list[dict[str, Any]]
+) -> list[TimelineSegment]:
+    by_chunk: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        by_chunk[event["chunk_id"]].append(event)
+
+    raw: list[dict[str, Any]] = []
+    previous_end: datetime | None = None
+    for chunk in sorted(chunks, key=lambda c: c["started_at"]):
+        start = parse_iso(chunk["started_at"])
+        if previous_end is not None:
+            gap = (start - previous_end).total_seconds()
+            if gap > GAP_TOLERANCE_SECONDS:
+                raw.append(
+                    {
+                        "kind": "capture_gap",
+                        "start": previous_end,
+                        "end": start,
+                        "ids": set(),
+                        "conf": [],
+                    }  # fmt: skip
+                )
+            elif gap < 0:
+                start = previous_end  # sub-tolerance overlap from mtime-derived timestamps
+        for piece in _chunk_segments(chunk, by_chunk.get(chunk["id"], [])):
+            raw.append(
+                {
+                    **piece,
+                    "start": start + timedelta(seconds=piece["start"]),
+                    "end": start + timedelta(seconds=piece["end"]),
+                }
+            )
+        previous_end = start + timedelta(seconds=float(chunk["duration_seconds"]))
+
+    merged: list[dict[str, Any]] = []
+    for piece in raw:
+        last = merged[-1] if merged else None
+        contiguous = (
+            last is not None
+            and last["kind"] == piece["kind"]
+            and (piece["start"] - last["end"]).total_seconds() <= GAP_TOLERANCE_SECONDS
+            and piece["kind"] != "capture_gap"
+        )
+        if contiguous:
+            last["end"] = piece["end"]
+            last["ids"] |= piece["ids"]
+            last["conf"].extend(piece["conf"])
+        else:
+            merged.append({**piece, "ids": set(piece["ids"]), "conf": list(piece["conf"])})
+
+    # Sub-half-second slivers (chunk-boundary rounding) are absorbed by the previous segment.
+    compact: list[dict[str, Any]] = []
+    for item in merged:
+        tiny = (item["end"] - item["start"]).total_seconds() < MIN_SEGMENT_SECONDS
+        if tiny and compact and "capture_gap" not in (compact[-1]["kind"], item["kind"]):
+            compact[-1]["end"] = item["end"]
+        else:
+            compact.append(item)
+
+    segments = []
+    for item in compact:
+        mean = sum(item["conf"]) / len(item["conf"]) if item["conf"] else None
+        segments.append(
+            TimelineSegment(
+                start=item["start"],
+                end=item["end"],
+                kind=item["kind"],
+                tier=_tier(item["kind"], mean),
+                event_count=len(item["ids"]),
+                mean_confidence=mean,
+            )
+        )
+    return segments
+
+
+def format_timeline(segments: list[TimelineSegment], tz: tzinfo = UTC) -> list[str]:
+    lines = []
+    for seg in segments:
+        a = seg.start.astimezone(tz).strftime("%H:%M:%S")
+        b = seg.end.astimezone(tz).strftime("%H:%M:%S")
+        lines.append(f"{a}–{b} {seg.kind} [{seg.tier}]")
+    return lines
+
+
+def distribution(segments: list[TimelineSegment]) -> list[dict[str, Any]]:
+    totals: dict[str, float] = defaultdict(float)
+    counts: dict[str, int] = defaultdict(int)
+    for seg in segments:
+        if seg.kind == "capture_gap":
+            continue
+        totals[seg.kind] += seg.duration_seconds
+        counts[seg.kind] += 1
+    grand = sum(totals.values())
+    return [
+        {
+            "kind": kind,
+            "seconds": round(totals[kind], 1),
+            "segments": counts[kind],
+            "percent": round(totals[kind] / grand * 100.0, 2) if grand else 0.0,
+        }
+        for kind in sorted(totals, key=lambda k: -totals[k])
+    ]
+
+
+def recurrent_candidates(
+    chunks: list[dict[str, Any]], events: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Identical chunk-level fingerprints seen in more than one chunk.
+
+    This is a weak signal (exact base64 equality), reported only as a candidate: it is
+    never labelled jingle/station-id/ad.
+    """
+    chunk_start = {c["id"]: c["started_at"] for c in chunks}
+    seen: dict[str, set[str]] = defaultdict(set)
+    for event in events:
+        if event.get("fingerprint") and event.get("chunk_id") in chunk_start:
+            seen[event["fingerprint"]].add(event["chunk_id"])
+    candidates = []
+    for fingerprint, chunk_ids in seen.items():
+        if len(chunk_ids) >= 2:
+            candidates.append(
+                {
+                    "label": "recurrent_audio_candidate",
+                    "tier": "Unknown",
+                    "fingerprint_prefix": fingerprint[:24],
+                    "occurrences": len(chunk_ids),
+                    "chunk_starts": sorted(chunk_start[c] for c in chunk_ids),
+                }
+            )
+    return sorted(candidates, key=lambda c: -c["occurrences"])

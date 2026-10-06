@@ -193,6 +193,51 @@ class InaSpeechMusicAnalyzer:
         return output
 
 
+def analyze_chunk(
+    db: Database,
+    session_id: str,
+    chunk: dict[str, Any],
+    analyzer: Analyzer,
+) -> None:
+    chunk_path = Path(chunk["path"])
+    chunk_duration = float(chunk["duration_seconds"])
+    try:
+        events = analyzer.analyze(chunk_path, chunk_duration)
+    except Exception as exc:
+        logger.error("Analysis crashed on chunk %s: %s", chunk["id"], exc)
+        db.add_incident(
+            session_id,
+            "analysis_failure",
+            f"chunk_id={chunk['id']} path={chunk_path.name} error={exc}",
+        )
+        events = [
+            {
+                "kind": "unknown",
+                "start_offset": 0.0,
+                "end_offset": chunk_duration,
+                "confidence": None,
+                "label": "analyzer-crashed",
+                "text": None,
+                "fingerprint": None,
+                "metadata": {"error": str(exc)},
+            }
+        ]
+
+    for event in events:
+        event["session_id"] = session_id
+        event["chunk_id"] = chunk["id"]
+        if event.get("metadata", {}).get("status") == "incident":
+            error_detail = event.get("metadata", {}).get("error", "unknown error")
+            db.add_incident(
+                session_id,
+                "transcription_incident",
+                f"chunk_id={chunk['id']} error={error_detail}",
+            )
+
+    db.add_events(events)
+    db.mark_chunk_analyzed(chunk["id"])
+
+
 def analyze_pending_chunks(
     db: Database,
     session_id: str,
@@ -200,42 +245,6 @@ def analyze_pending_chunks(
 ) -> int:
     analyzed_count = 0
     for chunk in db.unanalyzed_chunks(session_id):
-        chunk_path = Path(chunk["path"])
-        chunk_duration = float(chunk["duration_seconds"])
-        try:
-            events = analyzer.analyze(chunk_path, chunk_duration)
-        except Exception as exc:
-            logger.error("Analysis crashed on chunk %s: %s", chunk["id"], exc)
-            db.add_incident(
-                session_id,
-                "analysis_failure",
-                f"chunk_id={chunk['id']} path={chunk_path.name} error={exc}",
-            )
-            events = [
-                {
-                    "kind": "unknown",
-                    "start_offset": 0.0,
-                    "end_offset": chunk_duration,
-                    "confidence": None,
-                    "label": "analyzer-crashed",
-                    "text": None,
-                    "fingerprint": None,
-                    "metadata": {"error": str(exc)},
-                }
-            ]
-
-        for event in events:
-            event["session_id"] = session_id
-            event["chunk_id"] = chunk["id"]
-            if event.get("metadata", {}).get("status") == "incident":
-                error_detail = event.get("metadata", {}).get("error", "unknown error")
-                db.add_incident(
-                    session_id,
-                    "transcription_incident",
-                    f"chunk_id={chunk['id']} error={error_detail}",
-                )
-
-        db.add_events(events)
-        db.mark_chunk_analyzed(chunk["id"])
+        analyze_chunk(db, session_id, chunk, analyzer)
         analyzed_count += 1
     return analyzed_count
