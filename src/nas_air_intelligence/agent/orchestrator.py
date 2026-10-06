@@ -17,7 +17,7 @@ from typing import Any
 
 from ..analysis import Analyzer, FfmpegSilenceAnalyzer, analyze_chunk
 from ..db import Database
-from ..recorder import StreamMonitor
+from ..recorder import StreamMonitor, reap_orphan_ffmpeg
 from .report import write_agent_report
 from .resolver import ResolvedStream, StreamResolver
 from .states import AgentState
@@ -258,6 +258,7 @@ class MonitoringAgent:
         session_id = run["session_id"]
         self._session_id = session_id
         session = self.db.session(session_id)
+        self._reap_orphan_capture(session_id, session)
         if session and session["status"] == "running":
             self.db.add_incident(session_id, "worker_lost", "agent worker exited unexpectedly")
             self.db.finish_session(session_id, "stopped")
@@ -271,6 +272,25 @@ class MonitoringAgent:
         while analyzer.is_alive():
             analyzer.join(self.poll_seconds)
         return self._finalize_and_report(run)
+
+    def _reap_orphan_capture(self, session_id: str, session: dict[str, Any] | None) -> None:
+        """Stop an ffmpeg orphaned by the lost worker and keep the chunks it already wrote."""
+        output_dir = Path(session["output_dir"]) if session and session.get("output_dir") else None
+        if output_dir is None or not output_dir.is_dir():
+            return
+        try:
+            killed = reap_orphan_ffmpeg(output_dir)
+            if killed:
+                self.db.add_incident(
+                    session_id, "orphan_ffmpeg_reaped", f"terminated orphaned ffmpeg pid {killed}"
+                )
+            time.sleep(1.6)  # let chunk files pass the stability window before indexing
+            StreamMonitor(
+                db=self.db, ffmpeg=self.ffmpeg, ffprobe=self.ffprobe, storage_dir=self.storage_dir
+            )._index_new_chunks(session_id, output_dir, set())  # fmt: skip
+        except Exception:
+            logger.exception("orphan capture cleanup failed")
+            self._warn("orphan capture cleanup failed; some captured audio may be unindexed")
 
     def _finalize_and_report(self, run: dict[str, Any]) -> AgentState:
         session_id = self._session_id
