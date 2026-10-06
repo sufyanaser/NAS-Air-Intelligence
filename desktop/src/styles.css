@@ -1,0 +1,45 @@
+:root {
+  color-scheme: light dark;
+  font-family: "Segoe UI", system-ui, sans-serif;
+}
+body {
+  margin: 0;
+  background: Canvas;
+  color: CanvasText;
+}
+.shell {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 48px 24px;
+}
+h1 {
+  margin: 0;
+  font-size: 1.6rem;
+}
+.subtitle {
+  margin: 4px 0 32px;
+  opacity: 0.7;
+}
+.status {
+  padding: 16px 20px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, CanvasText 20%, transparent);
+}
+.status-ready {
+  border-color: #2e9e5b;
+}
+.status-failed {
+  border-color: #c0392b;
+}
+dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 16px;
+  margin: 12px 0 0;
+}
+dt {
+  opacity: 0.7;
+}
+dd {
+  margin: 0;
+}

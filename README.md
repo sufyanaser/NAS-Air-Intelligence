@@ -173,6 +173,24 @@ nas-air agent result <run-id|session-id>
 - Reports: `data/reports/<session-id>.agent.json` and `.agent.md`.
 - Run state lives in the `agent_runs` table of the same SQLite file.
 
+## Desktop control center (Phase 1 architecture spike, Windows)
+
+`desktop/` holds a Tauri 2 shell with a React + TypeScript UI. The existing Python core runs
+as a hidden sidecar (`nas_air_intelligence.sidecar`): loopback-only, bearer-token protected,
+and tied to the app's lifetime (stdin EOF, plus a Windows Job Object that kills the whole
+process tree if the app dies). The spike only proves the architecture: the UI shows the engine
+health reported by the sidecar.
+
+```powershell
+cd desktop
+npm ci
+powershell -File sidecar\build-sidecar.ps1   # freeze the Python sidecar with PyInstaller
+npm run tauri -- build                       # production build + NSIS installer
+powershell -File scripts\smoke-test.ps1      # acceptance checks against the built app
+```
+
+Requires Node 22+, Rust (stable, MSVC) and the Visual Studio C++ Build Tools.
+
 ## Data policy
 
 For monitored third-party stations, the project is intended for broadcast analysis and structured metadata. Reports should summarize programming structure and use only short excerpts where needed; they should not reproduce long copyrighted scripts or distribute captured music.
