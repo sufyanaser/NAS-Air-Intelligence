@@ -1,6 +1,6 @@
 # Roadmap
 
-## Milestone 1 — Reliable capture
+## Milestone 1 — Reliable capture [COMPLETED]
 
 - One internet-radio stream per session.
 - Timestamped bounded audio chunks.
@@ -9,23 +9,19 @@
 - Background Windows launcher.
 - JSON and Markdown session reports.
 
-## Milestone 2 — Validated broadcast segmentation
+## Milestone 2 — Broadcast segmentation & Speech foundation [IN PROGRESS]
 
-Target event classes:
-
-- `speech`
-- `music`
-- `silence`
-- `short_recurrent_audio`
-- `unknown`
-
-Acceptance criterion: validate classification on real Iraqi-radio samples before adding higher-level labels.
+- PyAV / faster-whisper GPU transcription foundation on CUDA float16.
+- CLI transcription tool (`nas-air transcribe`).
+- Timeline event structure with speech text, confidence, and timestamps.
+- FFmpeg built-in Chromaprint acoustic fingerprinting foundation.
+- Target event classes: `speech`, `silence`, `unknown`.
+- Validation on real Iraqi-radio audio when samples become available.
 
 ## Milestone 3 — Imaging and content intelligence
 
-- Acoustic fingerprints for recurring station IDs, sweepers, jingles, and promos.
-- Speech-only ASR using faster-whisper.
 - Recurrent-audio clustering and occurrence counts.
+- Station ID / jingle recurrence matching from acoustic fingerprints.
 - Optional music-recognition provider adapter.
 - Hourly clock-pattern analysis.
 
