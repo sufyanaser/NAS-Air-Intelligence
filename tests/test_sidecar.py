@@ -13,26 +13,42 @@ from pathlib import Path
 
 import pytest
 
+from nas_air_intelligence.agent.states import AgentState
 from nas_air_intelligence.sidecar import SidecarServer, health_payload
 
 TOKEN = "test-token"
 
 
-def _get(port: int, path: str, token: str | None = TOKEN, method: str = "GET"):
-    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method)
+def _get(port: int, path: str, token: str | None = TOKEN, method: str = "GET", body: bytes = b""):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method=method, data=body or None)
     if token is not None:
         req.add_header("Authorization", f"Bearer {token}")
+    if body:
+        req.add_header("Content-Type", "application/json")
     return urllib.request.urlopen(req, timeout=5)
 
 
 @pytest.fixture
-def server():
-    srv = SidecarServer(TOKEN)
+def server(tmp_path: Path):
+    srv = SidecarServer(TOKEN, storage=tmp_path / "data")
     thread = threading.Thread(target=srv.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
     thread.start()
     yield srv
     srv.shutdown()
     srv.server_close()
+
+
+@pytest.fixture
+def no_real_worker(monkeypatch):
+    """Agent endpoints must never spawn a real ffmpeg/network subprocess under pytest."""
+    calls: list[dict] = []
+
+    def fake_spawn_worker(run_id, **kwargs):
+        calls.append({"run_id": run_id, **kwargs})
+        return 4242
+
+    monkeypatch.setattr("nas_air_intelligence.agent.launcher.spawn_worker", fake_spawn_worker)
+    return calls
 
 
 def test_health_ready_with_token(server):
@@ -109,3 +125,111 @@ def test_process_refuses_to_start_without_token():
         env={**env, "PYTHONPATH": src}, capture_output=True, timeout=30,
     )  # fmt: skip
     assert proc.returncode == 2
+
+
+def test_default_storage_dir_is_per_user_not_cwd(monkeypatch, tmp_path: Path):
+    from nas_air_intelligence import sidecar
+
+    monkeypatch.delenv("NAS_AIR_STORAGE", raising=False)
+    monkeypatch.setattr(sidecar.sys, "platform", "win32")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert sidecar.default_storage_dir() == tmp_path / "NAS Air Intelligence"
+
+    monkeypatch.setenv("NAS_AIR_STORAGE", str(tmp_path / "override"))
+    assert sidecar.default_storage_dir() == tmp_path / "override"
+
+
+# ------------------------------------------------------------------------------ agent bridge
+def _start(server, no_real_worker, **overrides):
+    payload = {"station": "Test FM", "url": "https://s/live.mp3", "duration": "10m",
+               "analyzer": "baseline", **overrides}  # fmt: skip
+    with _get(server.server_address[1], "/agent/start", method="POST",
+              body=json.dumps(payload).encode()) as resp:  # fmt: skip
+        return json.loads(resp.read())
+
+
+def test_agent_start_launches_without_a_real_subprocess(server, no_real_worker):
+    result = _start(server, no_real_worker)
+    assert result["worker_pid"] == 4242 and result["station"] == "Test FM"
+    assert no_real_worker and no_real_worker[0]["run_id"] == result["run_id"]
+    # storage/db paths handed to the worker are the sidecar's own, not relative to any cwd
+    assert no_real_worker[0]["storage"] == server.storage
+    assert no_real_worker[0]["db_path"] == server.db_path
+
+
+def test_agent_start_rejects_missing_fields(server, no_real_worker):
+    port = server.server_address[1]
+    with pytest.raises(urllib.error.HTTPError) as err:
+        _get(port, "/agent/start", method="POST", body=json.dumps({"station": "S"}).encode())
+    assert err.value.code == 400
+    assert not no_real_worker
+
+
+def test_agent_status_stop_result_journal_timeline_round_trip(server, no_real_worker):
+    port = server.server_address[1]
+    run_id = _start(server, no_real_worker)["run_id"]
+
+    with _get(port, f"/agent/{run_id}/status") as resp:
+        status = json.loads(resp.read())
+    assert status["run_id"] == run_id and status["state"] == "CREATED"
+
+    # a short id prefix resolves the same run, matching the CLI's own lookup rules
+    with _get(port, f"/agent/{run_id[:8]}/status") as resp:
+        assert json.loads(resp.read())["run_id"] == run_id
+
+    with pytest.raises(urllib.error.HTTPError) as err:
+        _get(port, f"/agent/{run_id}/result")
+    assert err.value.code == 409  # not finished yet
+
+    with _get(port, f"/agent/{run_id}/stop", method="POST") as resp:
+        stop = json.loads(resp.read())
+    assert stop["run_id"] == run_id
+
+    with _get(port, f"/agent/{run_id}/timeline") as resp:
+        timeline = json.loads(resp.read())
+    assert timeline == {
+        "run_id": run_id, "session_id": None,
+        "segments": [], "rendered": [], "current_material": None,
+    }  # fmt: skip
+
+    with _get(port, f"/agent/{run_id}/journal") as resp:
+        journal = json.loads(resp.read())
+    assert journal["run_id"] == run_id and journal["events"] == []
+
+    with pytest.raises(urllib.error.HTTPError) as err:
+        _get(port, "/agent/00000000-0000-0000-0000-000000000000/status")
+    assert err.value.code == 404
+
+
+# ------------------------------------------------------------------------------ WebSocket
+def test_agent_events_websocket_notifies_on_change_and_closes_on_terminal_state(
+    server, no_real_worker
+):
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.client import connect
+
+    run_id = _start(server, no_real_worker)["run_id"]
+    url = f"ws://127.0.0.1:{server.server_address[1]}/agent/{run_id}/events"
+    with connect(url, additional_headers={"Authorization": f"Bearer {TOKEN}"}) as ws:
+        first = json.loads(ws.recv(timeout=5))
+        assert first == {"event": "changed", "run_id": run_id, "state": "CREATED"}
+
+        server.store.transition(run_id, AgentState.RESOLVING_STREAM)
+        second = json.loads(ws.recv(timeout=5))
+        assert second["state"] == "RESOLVING_STREAM"
+
+        server.store.update(run_id, state="FAILED", error="boom")
+        third = json.loads(ws.recv(timeout=5))
+        assert third["state"] == "FAILED"
+
+        with pytest.raises(ConnectionClosed):  # server sends a close frame once terminal
+            ws.recv(timeout=5)
+
+
+def test_agent_events_websocket_unknown_run_is_404(server):
+    from websockets.exceptions import InvalidStatus
+    from websockets.sync.client import connect
+
+    url = f"ws://127.0.0.1:{server.server_address[1]}/agent/does-not-exist/events"
+    with pytest.raises(InvalidStatus):
+        connect(url, additional_headers={"Authorization": f"Bearer {TOKEN}"})

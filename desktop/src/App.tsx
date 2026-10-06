@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import AgentPanel from "./AgentPanel";
 import { fetchSidecarHealth, waitForSidecar, type HealthFetcher, type HealthState } from "./health";
 
 interface AppProps {
@@ -36,6 +37,7 @@ export default function App({ fetcher = fetchSidecarHealth, intervalMs }: AppPro
         )}
         {state.phase === "failed" && <p role="alert">Engine unavailable: {state.error}</p>}
       </section>
+      {state.phase === "ready" && <AgentPanel />}
     </main>
   );
 }

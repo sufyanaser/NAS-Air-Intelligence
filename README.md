@@ -191,6 +191,29 @@ powershell -File scripts\smoke-test.ps1      # acceptance checks against the bui
 
 Requires Node 22+, Rust (stable, MSVC) and the Visual Studio C++ Build Tools.
 
+### Agent bridge (Phase 2, Command Bridge + Run Journal + Live Events)
+
+The sidecar extends the Phase 1 health endpoint with the Desktop-to-Core Contract
+(Phase2.md section 11): `POST /agent/start`, `GET /agent/{id}/status`,
+`POST /agent/{id}/stop`, `GET /agent/{id}/result`, `GET /agent/{id}/timeline`,
+`GET /agent/{id}/journal`, and `WS /agent/{id}/events`. All of it is loopback-only and
+bearer-token authenticated, reached from the UI through Tauri `invoke` commands
+(`agent_start`, `agent_status`, `agent_stop`, `agent_result`, `agent_timeline`,
+`agent_journal`, `agent_watch`) - the webview never holds the token.
+
+The WebSocket is notification only: each frame just means "something changed, re-fetch".
+The Rust shell forwards frames as an `agent-event` Tauri event; the frontend's own poll
+interval is the actual safety net, so losing the socket (or the UI being closed and
+reopened) never stops or hides a monitoring run - the run is a separate detached process
+backed by the same SQLite state the CLI uses. The Agent Run Journal
+(`agent_events` table, written by the orchestrator at each stage - never inferred from
+stdout/stderr) is what the desktop's activity feed reads.
+
+A frozen sidecar build has no separate `python.exe`, so it also serves as the agent
+worker `spawn_worker` launches: `nas-air-sidecar.exe cli --db ... agent _run ...` (the
+`cli` token tells the frozen entry point to dispatch into the regular CLI parser instead
+of starting the HTTP server; see `desktop/sidecar/entry.py`).
+
 ## Data policy
 
 For monitored third-party stations, the project is intended for broadcast analysis and structured metadata. Reports should summarize programming structure and use only short excerpts where needed; they should not reproduce long copyrighted scripts or distribute captured music.

@@ -41,13 +41,31 @@ pub fn new_token() -> Result<String, String> {
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// A request as the sidecar sees it; the response body is returned only for HTTP 200.
+/// An HTTP response from the sidecar: the status is kept so callers can distinguish, for
+/// example, "run not finished yet" (409) from a real failure, rather than only seeing a body.
+pub struct HttpResponse {
+    pub status: u16,
+    pub body: serde_json::Value,
+}
+
+/// A GET or a bodyless POST (`/shutdown`, `/agent/{id}/stop`) against the sidecar.
 pub fn http_request(
     port: u16,
     method: &str,
     path: &str,
     token: &str,
-) -> Result<serde_json::Value, String> {
+) -> Result<HttpResponse, String> {
+    http_request_with_body(port, method, path, token, None)
+}
+
+/// Same as [`http_request`], optionally sending a JSON body (used by `POST /agent/start`).
+pub fn http_request_with_body(
+    port: u16,
+    method: &str,
+    path: &str,
+    token: &str,
+    json_body: Option<&serde_json::Value>,
+) -> Result<HttpResponse, String> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
     let mut stream =
         TcpStream::connect_timeout(&addr, HTTP_TIMEOUT).map_err(|e| format!("connect: {e}"))?;
@@ -57,10 +75,13 @@ pub fn http_request(
     stream
         .set_write_timeout(Some(HTTP_TIMEOUT))
         .map_err(|e| e.to_string())?;
-    let request = format!(
+    let body = json_body.map(|v| v.to_string()).unwrap_or_default();
+    let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\n\
-         Content-Length: 0\r\nConnection: close\r\n\r\n"
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
     );
+    request.push_str(&body);
     stream
         .write_all(request.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
@@ -71,7 +92,7 @@ pub fn http_request(
     parse_http_response(&raw)
 }
 
-pub fn parse_http_response(raw: &[u8]) -> Result<serde_json::Value, String> {
+pub fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
     let text = String::from_utf8_lossy(raw);
     let (head, body) = text
         .split_once("\r\n\r\n")
@@ -82,10 +103,55 @@ pub fn parse_http_response(raw: &[u8]) -> Result<serde_json::Value, String> {
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|s| s.parse().ok())
         .ok_or("malformed HTTP status line")?;
-    if status != 200 {
-        return Err(format!("sidecar returned HTTP {status}"));
+    let trimmed = body.trim();
+    let value = if trimmed.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_str(trimmed).map_err(|e| format!("bad JSON body: {e}"))?
+    };
+    Ok(HttpResponse {
+        status,
+        body: value,
+    })
+}
+
+/// Blocks, forwarding each notification frame from `/agent/{run_id}/events` to `on_message`,
+/// until the connection closes or `on_message` returns `false`. WebSocket here is notification
+/// only (Phase2.md section 11): the message content is not load-bearing, only its arrival is -
+/// callers re-fetch the REST endpoints on receipt.
+pub fn watch_agent_events(
+    port: u16,
+    token: &str,
+    run_id: &str,
+    mut on_message: impl FnMut(&str) -> bool,
+) -> Result<(), String> {
+    use tungstenite::client::IntoClientRequest;
+    use tungstenite::http::HeaderValue;
+
+    let url = format!("ws://127.0.0.1:{port}/agent/{run_id}/events");
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| format!("bad websocket url: {e}"))?;
+    let header = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|e| format!("bad token header: {e}"))?;
+    request.headers_mut().insert("Authorization", header);
+
+    let (mut socket, _response) =
+        tungstenite::connect(request).map_err(|e| format!("websocket connect: {e}"))?;
+    loop {
+        match socket.read() {
+            Ok(tungstenite::Message::Text(text)) => {
+                if !on_message(text.as_str()) {
+                    break;
+                }
+            }
+            Ok(tungstenite::Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed) => break,
+            Err(e) => return Err(format!("websocket read: {e}")),
+        }
     }
-    serde_json::from_str(body.trim()).map_err(|e| format!("bad JSON body: {e}"))
+    Ok(())
 }
 
 pub struct Sidecar {
@@ -244,9 +310,27 @@ mod tests {
     #[test]
     fn parses_http_responses() {
         let ok = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"status\":\"ready\"}";
-        assert_eq!(parse_http_response(ok).unwrap()["status"], "ready");
+        let parsed = parse_http_response(ok).unwrap();
+        assert_eq!(parsed.status, 200);
+        assert_eq!(parsed.body["status"], "ready");
+
         let denied = b"HTTP/1.1 401 Unauthorized\r\n\r\n{\"error\":\"unauthorized\"}";
-        assert!(parse_http_response(denied).unwrap_err().contains("401"));
+        let parsed = parse_http_response(denied).unwrap();
+        assert_eq!(parsed.status, 401);
+        assert_eq!(parsed.body["error"], "unauthorized");
+
         assert!(parse_http_response(b"garbage").is_err());
+    }
+
+    #[test]
+    fn watch_agent_events_fails_fast_on_an_unreachable_sidecar() {
+        // Port 1 is a reserved/unused low port: nothing listens there, so connect fails quickly
+        // instead of hanging - proving the watcher surfaces a connection error rather than
+        // blocking forever when the sidecar has already gone away.
+        let err = watch_agent_events(1, "token", "run-id", |_| true).unwrap_err();
+        assert!(
+            err.contains("connect") || err.contains("websocket"),
+            "{err}"
+        );
     }
 }

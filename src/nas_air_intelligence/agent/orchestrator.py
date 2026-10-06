@@ -93,6 +93,19 @@ class MonitoringAgent:
         logger.warning("run %s: %s", self.run_id, message)
         self.store.add_warning(self.run_id, message)
 
+    def _log(
+        self, stage: AgentState, event_type: str, *, status: str = "ok",
+        message: str | None = None, details: dict[str, Any] | None = None, severity: str = "info",
+    ) -> None:  # fmt: skip
+        """Agent Run Journal entry. The desktop activity feed reads these back, newest first."""
+        try:
+            self.store.log_event(
+                self.run_id, stage=stage.value, event_type=event_type, status=status,
+                message=message, details=details, severity=severity, session_id=self._session_id,
+            )  # fmt: skip
+        except Exception:  # the journal is best effort; it must never interrupt capture
+            logger.exception("journal write failed")
+
     def _heartbeat_loop(self) -> None:
         while not self._halt.wait(HEARTBEAT_INTERVAL):
             try:
@@ -150,6 +163,10 @@ class MonitoringAgent:
 
     def _resolve_and_verify(self, run: dict[str, Any]) -> ResolvedStream | None:
         self._state(AgentState.RESOLVING_STREAM)
+        self._log(
+            AgentState.RESOLVING_STREAM, "STREAM_RESOLUTION_STARTED",
+            message=f"resolving {run['station_name']}",
+        )  # fmt: skip
         # Resolution and verification happen in one resolver call; the state is advanced
         # in between so status shows what the agent is doing.
         self._state(AgentState.VERIFYING_STREAM)
@@ -158,17 +175,28 @@ class MonitoringAgent:
         )
         self.store.update(self.run_id, resolved=stream.to_dict())
         if stream.verification_status != "verified":
-            self._state(
-                AgentState.STREAM_UNAVAILABLE,
-                error=stream.details.get("error", "stream verification failed"),
-            )
+            error = stream.details.get("error", "stream verification failed")
+            self._log(
+                AgentState.VERIFYING_STREAM, "STREAM_UNAVAILABLE",
+                status="failed", severity="error", message=error,
+            )  # fmt: skip
+            self._state(AgentState.STREAM_UNAVAILABLE, error=error)
             return None
+        self._log(
+            AgentState.VERIFYING_STREAM, "STREAM_RESOLVED",
+            message=stream.resolved_stream_url, details={"url": stream.resolved_stream_url},
+        )  # fmt: skip
+        self._log(AgentState.VERIFYING_STREAM, "STREAM_VERIFIED", message="stream confirmed")
         return stream
 
     def _capture_thread(self, station_id: str, run: dict[str, Any]) -> None:
         def on_session(session_id: str) -> None:
             self._session_id = session_id
             self.store.update(self.run_id, session_id=session_id)
+            self._log(
+                AgentState.CAPTURING, "SESSION_STARTED", message=f"session {session_id} started",
+            )  # fmt: skip
+            self._log(AgentState.CAPTURING, "CAPTURE_STARTED", message="capture started")
             self._session_ready.set()
 
         try:
@@ -196,6 +224,7 @@ class MonitoringAgent:
             self._degraded = True
             analyzer = FfmpegSilenceAnalyzer(ffmpeg=self.ffmpeg)
         consecutive = 0
+        started_analysis = False
         drain_started: float | None = None
         while not self._halt.is_set():
             pending = self.db.unanalyzed_chunks(session_id)
@@ -208,24 +237,38 @@ class MonitoringAgent:
                 drain_started = drain_started or time.monotonic()
                 if time.monotonic() - drain_started > self.drain_timeout:
                     return
+            if not started_analysis:
+                started_analysis = True
+                self._log(AgentState.PROCESSING, "ANALYSIS_STARTED", message=run["analyzer"])
+            chunk = pending[0]
             before = self._failure_count(session_id)
-            analyze_chunk(self.db, session_id, pending[0], analyzer)
+            analyze_chunk(self.db, session_id, chunk, analyzer)
             if self._failure_count(session_id) > before:
                 consecutive += 1
                 if consecutive >= DEGRADED_AFTER_FAILURES and not self._degraded:
                     self._degraded = True
-                    self._warn(
+                    message = (
                         f"processing degraded: {consecutive} consecutive chunks failed analysis; "
                         "capture continues"
                     )
+                    self._warn(message)
+                    self._log(
+                        AgentState.PROCESSING, "PROCESSING_BACKLOG_WARNING",
+                        status="warn", severity="warn", message=message,
+                    )  # fmt: skip
             else:
                 consecutive = 0
+                self._log(
+                    AgentState.PROCESSING, "TRANSCRIPTION_COMPLETED",
+                    message=f"chunk {chunk['id'][:8]} analyzed", details={"chunk_id": chunk["id"]},
+                )  # fmt: skip
 
     def _failure_count(self, session_id: str) -> int:
         return sum(1 for i in self.db.incidents(session_id) if i["kind"] in _FAILURE_KINDS)
 
     def _supervise(self, capture: threading.Thread) -> None:
         last_chunks, last_progress = 0, time.monotonic()
+        last_reconnects = 0
         stall_warned = False
         run = self.store.get(self.run_id) or {}
         stall_after = 3 * float(run.get("segment_seconds", 300)) + 90
@@ -237,12 +280,28 @@ class MonitoringAgent:
             if self._session_id:
                 count = len(self.db.chunks(self._session_id))
                 if count != last_chunks:
+                    if count > last_chunks:
+                        self._log(
+                            AgentState.CAPTURING, "CHUNK_CAPTURED",
+                            message=f"{count - last_chunks} new chunk(s) captured",
+                            details={"total_chunks": count},
+                        )  # fmt: skip
                     last_chunks, last_progress, stall_warned = count, time.monotonic(), False
                 elif time.monotonic() - last_progress > stall_after and not stall_warned:
                     stall_warned = True
                     self._warn(f"capture stalled: no new chunk for {stall_after:.0f}s")
+                reconnects = sum(
+                    1 for i in self.db.incidents(self._session_id) if i["kind"] == "ffmpeg_exit"
+                )
+                if reconnects > last_reconnects:
+                    last_reconnects = reconnects
+                    self._log(
+                        AgentState.CAPTURING, "STREAM_RECONNECTED",
+                        status="warn", severity="warn", message="ffmpeg reconnected after exit",
+                    )  # fmt: skip
         if self._capture_error:
             self._warn(f"capture ended with an error: {self._capture_error}")
+        self._log(AgentState.CAPTURING, "CAPTURE_COMPLETED", message="capture ended")
 
     def _finish(self, analyzer: threading.Thread, run: dict[str, Any]) -> AgentState:
         self._state(AgentState.PROCESSING)
@@ -263,6 +322,10 @@ class MonitoringAgent:
             self.db.add_incident(session_id, "worker_lost", "agent worker exited unexpectedly")
             self.db.finish_session(session_id, "stopped")
         self._warn("recovered after the agent worker was lost; capture ended early")
+        self._log(
+            AgentState.PROCESSING, "CAPTURE_COMPLETED",
+            status="warn", severity="warn", message="recovered after the worker was lost",
+        )  # fmt: skip
         self._capture_done.set()
         self._session_ready.set()
         if run["state"] in {AgentState.CAPTURING.value}:
@@ -309,6 +372,14 @@ class MonitoringAgent:
         )  # fmt: skip
         for problem in problems:
             self._warn(f"report review: {problem}")
+        for gate in report["capture_health"]["gates"]:
+            self._log(
+                AgentState.REPORTING, "QUALITY_GATE_EVALUATED",
+                status=gate["status"],
+                severity="info" if gate["status"] == "pass" else "warn",
+                message=f"{gate['gate']}: {gate['status']}",
+                details=gate,
+            )  # fmt: skip
         outcome = report["outcome"]
         if outcome == "COMPLETED" and (self._degraded or self._warnings_present() or problems):
             outcome = "COMPLETED_WITH_WARNINGS"
@@ -325,6 +396,9 @@ class MonitoringAgent:
                 "executive_summary": report["executive_summary"],
                 "review_problems": problems,
             },
+        )
+        self._log(
+            final, "REPORT_CREATED", message=str(json_path), details={"report_json": str(json_path)}
         )
         return final
 

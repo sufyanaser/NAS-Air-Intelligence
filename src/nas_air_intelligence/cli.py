@@ -14,7 +14,6 @@ from .analysis import (
     WhisperSpeechAnalyzer,
     analyze_pending_chunks,
 )
-from .api import create_app
 from .db import Database
 from .ffmpeg import ToolMissingError
 from .recorder import StreamMonitor
@@ -113,6 +112,8 @@ def command_report(args: argparse.Namespace) -> int:
 
 def command_api(args: argparse.Namespace) -> int:
     import uvicorn
+
+    from .api import create_app
 
     app = create_app(_db_path(args))
     uvicorn.run(app, host=args.host, port=args.port)
