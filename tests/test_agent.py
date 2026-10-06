@@ -316,6 +316,79 @@ def test_full_lifecycle_completes_and_writes_report(tmp_path: Path):
     assert all(c["analyzed"] for c in db.chunks(run["session_id"]))
 
 
+def test_full_lifecycle_writes_a_run_journal(tmp_path: Path):
+    """The Agent Run Journal (Phase2.md section 9): the desktop activity feed reads this back."""
+    db, store, run_id = _setup(tmp_path)
+    agent = _agent(db, store, run_id, tmp_path, FakeMonitor(db, chunks=2))
+    assert agent.run(pid=123) == AgentState.COMPLETED
+
+    journal = store.events(run_id)
+    types = [e["event_type"] for e in journal]
+    # newest first
+    assert journal == sorted(journal, key=lambda e: e["occurred_at"], reverse=True)
+    for expected in [
+        "STREAM_RESOLUTION_STARTED", "STREAM_RESOLVED", "STREAM_VERIFIED",
+        "SESSION_STARTED", "CAPTURE_STARTED", "CHUNK_CAPTURED", "ANALYSIS_STARTED",
+        "TRANSCRIPTION_COMPLETED", "CAPTURE_COMPLETED", "QUALITY_GATE_EVALUATED",
+        "REPORT_CREATED",
+    ]:  # fmt: skip
+        assert expected in types, f"missing {expected} in {types}"
+    session_rows = [e for e in journal if e["event_type"] == "SESSION_STARTED"]
+    assert session_rows[0]["session_id"] == store.get(run_id)["session_id"]
+    assert all(e["details"] == {} or isinstance(e["details"], dict) for e in journal)
+
+
+def test_run_journal_flags_a_degraded_analyzer_and_a_failed_stream(tmp_path: Path):
+    db, store, run_id = _setup(tmp_path)
+    agent = _agent(
+        db, store, run_id, tmp_path, FakeMonitor(db, chunks=3), analyzer=CrashingAnalyzer
+    )
+    agent.run(pid=1)
+    types_status = [(e["event_type"], e["status"]) for e in store.events(run_id)]
+    assert ("PROCESSING_BACKLOG_WARNING", "warn") in types_status
+
+    db2, store2, run_id2 = _setup(tmp_path)
+    agent2 = _agent(db2, store2, run_id2, tmp_path, FakeMonitor(db2), verified=False)
+    assert agent2.run(pid=1) == AgentState.STREAM_UNAVAILABLE
+    failed = [e for e in store2.events(run_id2) if e["event_type"] == "STREAM_UNAVAILABLE"]
+    assert failed and failed[0]["severity"] == "error" and failed[0]["status"] == "failed"
+
+
+def test_live_timeline_reports_current_material(tmp_path: Path):
+    db, store, run_id = _setup(tmp_path)
+    agent = _agent(db, store, run_id, tmp_path, FakeMonitor(db, chunks=2))
+    assert agent.run(pid=1) == AgentState.COMPLETED
+    session_id = store.get(run_id)["session_id"]
+
+    live = launcher.live_timeline(db, session_id)
+    assert live["segments"] and live["rendered"]
+    material = live["current_material"]
+    assert material is not None
+    assert material["kind"] in {"speech", "silence", "unknown_audio"}
+    assert "text" in material and "confidence" in material
+
+    assert launcher.live_timeline(db, None) == {
+        "segments": [], "rendered": [], "current_material": None,
+    }  # fmt: skip
+
+
+def test_live_metrics_reports_processed_and_pending_chunks(tmp_path: Path):
+    db, store, run_id = _setup(tmp_path)
+    agent = _agent(db, store, run_id, tmp_path, FakeMonitor(db, chunks=2))
+    assert agent.run(pid=1) == AgentState.COMPLETED
+    session_id = store.get(run_id)["session_id"]
+    metrics = launcher.live_metrics(db, session_id)
+    assert metrics["processed_chunks"] == 2 and metrics["pending_chunks"] == 0
+    assert metrics["processed_chunks"] + metrics["pending_chunks"] == metrics["chunks"]
+
+
+def test_store_find_matches_id_session_and_unambiguous_prefix(tmp_path: Path):
+    db, store, run_id = _setup(tmp_path)
+    assert store.find(run_id)["id"] == run_id
+    assert store.find(run_id[:8])["id"] == run_id
+    assert store.find("not-a-real-id") is None
+
+
 def test_stream_unavailable_stops_before_capture(tmp_path: Path):
     db, store, run_id = _setup(tmp_path)
     agent = _agent(db, store, run_id, tmp_path, FakeMonitor(db), verified=False)
@@ -491,8 +564,33 @@ def test_spawn_worker_is_detached_and_logs(tmp_path: Path, monkeypatch):
     assert len(list((tmp_path / "logs").glob("agent-run-1234*"))) == 2
 
 
+def test_spawn_worker_in_a_frozen_sidecar_uses_the_cli_sentinel(tmp_path: Path, monkeypatch):
+    """A frozen onefile build has no separate python.exe for "-m nas_air_intelligence.cli":
+    the worker command must invoke the frozen exe itself with the "cli" dispatch sentinel
+    (see desktop/sidecar/entry.py) instead."""
+    seen: dict[str, Any] = {}
+
+    class FakeProc:
+        pid = 777
+
+    def fake_popen(command, **kwargs):
+        seen["command"] = command
+        return FakeProc()
+
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(launcher.sys, "frozen", True, raising=False)
+    pid = launcher.spawn_worker(
+        "run-1234567890", db_path="d.db", storage="data", log_dir=tmp_path / "logs"
+    )
+    assert pid == 777
+    assert seen["command"] == [
+        sys.executable, "cli", "--db", "d.db", "agent", "_run", "run-1234567890",
+        "--storage", "data",
+    ]  # fmt: skip
+
+
 def test_cli_start_status_stop_result(tmp_path: Path, monkeypatch, capsys):
-    monkeypatch.setattr("nas_air_intelligence.agent.cli.spawn_worker", lambda *a, **k: 777)
+    monkeypatch.setattr("nas_air_intelligence.agent.launcher.spawn_worker", lambda *a, **k: 777)
     db_path = str(tmp_path / "cli.db")
     base = ["--db", db_path]
     assert main([*base, "agent", "start", "--station", "S", "--url", "https://s/x.mp3",
@@ -506,6 +604,18 @@ def test_cli_start_status_stop_result(tmp_path: Path, monkeypatch, capsys):
 
     assert main([*base, "agent", "result", started["run_id"]]) == 1  # not finished
     capsys.readouterr()
+
+    assert main([*base, "agent", "timeline", started["run_id"]]) == 0
+    timeline = json.loads(capsys.readouterr().out)
+    assert timeline == {
+        "run_id": started["run_id"], "session_id": None,
+        "segments": [], "rendered": [], "current_material": None,
+    }  # fmt: skip
+
+    assert main([*base, "agent", "journal", started["run_id"]]) == 0
+    journal = json.loads(capsys.readouterr().out)
+    assert journal == {"run_id": started["run_id"], "events": []}
+
     assert main([*base, "agent", "stop", started["run_id"], "--storage", str(tmp_path / "d")]) == 0
     assert "worker lost before capture" in capsys.readouterr().out
 

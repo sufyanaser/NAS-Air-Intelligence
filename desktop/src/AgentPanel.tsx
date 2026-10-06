@@ -1,0 +1,306 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  fetchAgentJournal,
+  fetchAgentResult,
+  fetchAgentStatus,
+  fetchAgentTimeline,
+  isTerminal,
+  onAgentEvent,
+  startAgent,
+  stopAgent,
+  watchAgent,
+  type AgentChangedEvent,
+  type AgentStatus,
+  type JournalEvent,
+  type TimelineResponse,
+} from "./agent";
+
+const LAST_RUN_KEY = "nas-air:lastRunId";
+const POLL_MS = 3000;
+
+/** A per-viewer convenience only: which run to resume showing. The backend's SQLite state,
+ * never this, is authoritative - losing it just means the operator re-pastes the station. */
+function readLastRunId(): string | null {
+  try {
+    return window.localStorage.getItem(LAST_RUN_KEY);
+  } catch {
+    return null;
+  }
+}
+
+function writeLastRunId(runId: string | null): void {
+  try {
+    if (runId) window.localStorage.setItem(LAST_RUN_KEY, runId);
+    else window.localStorage.removeItem(LAST_RUN_KEY);
+  } catch {
+    // best effort - a fresh Start is the fallback
+  }
+}
+
+interface Api {
+  start: typeof startAgent;
+  status: typeof fetchAgentStatus;
+  stop: typeof stopAgent;
+  result: typeof fetchAgentResult;
+  timeline: typeof fetchAgentTimeline;
+  journal: typeof fetchAgentJournal;
+  watch: typeof watchAgent;
+  onEvent: typeof onAgentEvent;
+}
+
+const defaultApi: Api = {
+  start: startAgent,
+  status: fetchAgentStatus,
+  stop: stopAgent,
+  result: fetchAgentResult,
+  timeline: fetchAgentTimeline,
+  journal: fetchAgentJournal,
+  watch: watchAgent,
+  onEvent: onAgentEvent,
+};
+
+interface AgentPanelProps {
+  api?: Api;
+  pollMs?: number;
+}
+
+function formatClock(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return [h, m, sec].map((n) => String(n).padStart(2, "0")).join(":");
+}
+
+export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: AgentPanelProps) {
+  const [runId, setRunId] = useState<string | null>(() => readLastRunId());
+  const [status, setStatus] = useState<AgentStatus | null>(null);
+  const [timeline, setTimeline] = useState<TimelineResponse | null>(null);
+  const [journal, setJournal] = useState<JournalEvent[]>([]);
+  const [formError, setFormError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+  const runIdRef = useRef(runId);
+  runIdRef.current = runId;
+
+  const refresh = async (id: string) => {
+    try {
+      const nextStatus = await api.status(id);
+      if (runIdRef.current !== id) return; // superseded while this call was in flight
+      setStatus(nextStatus);
+      if (nextStatus.session_id) {
+        const [nextTimeline, nextJournal] = await Promise.all([
+          api.timeline(id),
+          api.journal(id),
+        ]);
+        if (runIdRef.current !== id) return;
+        setTimeline(nextTimeline);
+        setJournal(nextJournal.events);
+      }
+    } catch (error) {
+      if (runIdRef.current === id) {
+        setStatus((prev) =>
+          prev ? { ...prev, attention: error instanceof Error ? error.message : String(error) } : prev,
+        );
+      }
+    }
+  };
+
+  // Resume (or start watching) whenever the active run changes - this is what makes closing
+  // and reopening the UI, or the sidecar restarting, resume the same view: the run itself is
+  // a separate detached process the UI never owned.
+  useEffect(() => {
+    if (!runId) return;
+    void refresh(runId);
+    void api.watch(runId);
+    const interval = window.setInterval(() => void refresh(runId), pollMs);
+    return () => window.clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runId, pollMs]);
+
+  // The WebSocket notification is purely a "refresh sooner" nudge; losing it changes nothing
+  // but latency, because the interval above keeps polling regardless.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void api.onEvent((event: AgentChangedEvent) => {
+      if (event.event === "changed" && event.run_id && event.run_id === runIdRef.current) {
+        void refresh(event.run_id);
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleStart = async (form: FormData) => {
+    setFormError(null);
+    const station = String(form.get("station") || "").trim();
+    const input = String(form.get("source") || "").trim();
+    if (!station || !input) {
+      setFormError("Station name and a page or stream URL are both required.");
+      return;
+    }
+    const isUrl = /^[a-z][a-z0-9+.-]*:\/\//i.test(input) && /\.(mp3|aac|m3u8|pls|m4a)(\?|$)/i.test(input);
+    setStarting(true);
+    try {
+      const result = await api.start({
+        station,
+        page: isUrl ? undefined : input,
+        url: isUrl ? input : undefined,
+        duration: String(form.get("duration") || "10m"),
+        analyzer: (form.get("analyzer") as "whisper" | "baseline") || "whisper",
+      });
+      writeLastRunId(result.run_id);
+      setStatus(null);
+      setTimeline(null);
+      setJournal([]);
+      setRunId(result.run_id);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setStarting(false);
+    }
+  };
+
+  const handleStop = async () => {
+    if (!runId) return;
+    try {
+      await api.stop(runId);
+      await refresh(runId);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const terminal = status ? isTerminal(status.state) : false;
+  const showStartForm = !runId || terminal;
+
+  return (
+    <section className="agent" aria-label="Monitoring agent">
+      {showStartForm && (
+        <form
+          className="start-form"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void handleStart(new FormData(e.currentTarget));
+          }}
+        >
+          <input name="station" placeholder="Station name" aria-label="Station name" />
+          <input
+            name="source"
+            placeholder="Station page or stream URL"
+            aria-label="Station page or stream URL"
+          />
+          <select name="duration" defaultValue="10m" aria-label="Duration">
+            <option value="10m">10 minutes (smoke)</option>
+            <option value="2h">2 hours (validation)</option>
+          </select>
+          <select name="analyzer" defaultValue="whisper" aria-label="Analyzer">
+            <option value="whisper">Whisper (speech transcription)</option>
+            <option value="baseline">Baseline (silence only)</option>
+          </select>
+          <button type="submit" disabled={starting}>
+            {starting ? "Starting…" : "Start"}
+          </button>
+          {formError && <p role="alert">{formError}</p>}
+        </form>
+      )}
+
+      {status && (
+        <div className="agent-grid">
+          <div className="panel" aria-label="Station">
+            <h2>Station</h2>
+            <p className="station-name">{status.station}</p>
+            <p className="state-badge" data-state={status.state}>
+              {status.state}
+            </p>
+            {status.requested_seconds != null && status.elapsed_seconds != null && (
+              <p className="timer">
+                {formatClock(status.elapsed_seconds)} / {formatClock(status.requested_seconds)}
+              </p>
+            )}
+            {!terminal && (
+              <button type="button" onClick={() => void handleStop()}>
+                Stop monitoring
+              </button>
+            )}
+          </div>
+
+          <div className="panel" aria-label="Current material">
+            <h2>Current Material</h2>
+            {timeline?.current_material ? (
+              <>
+                <p className="material-kind">{timeline.current_material.kind.toUpperCase()}</p>
+                <p className="material-time">
+                  {new Date(timeline.current_material.start).toLocaleTimeString()}
+                </p>
+                {timeline.current_material.text && <p>{timeline.current_material.text}</p>}
+                {timeline.current_material.confidence != null && (
+                  <p className="confidence">
+                    Confidence {timeline.current_material.confidence.toFixed(2)}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p>No classified material yet.</p>
+            )}
+          </div>
+
+          <div className="panel" aria-label="Live operations">
+            <h2>Live Operations</h2>
+            <ul className="activity-feed">
+              {journal.slice(0, 12).map((event) => (
+                <li key={event.id} data-severity={event.severity}>
+                  <span className="event-type">{event.event_type.replaceAll("_", " ")}</span>
+                  {event.message && <span className="event-message"> — {event.message}</span>}
+                </li>
+              ))}
+              {journal.length === 0 && <li>No activity yet.</li>}
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {status && (
+        <div className="panel" aria-label="Timeline">
+          <h2>Timeline</h2>
+          <ul className="timeline-list">
+            {(timeline?.rendered ?? []).map((line, i) => (
+              <li key={i}>{line}</li>
+            ))}
+            {(timeline?.rendered ?? []).length === 0 && <li>No timeline yet.</li>}
+          </ul>
+        </div>
+      )}
+
+      {status && (
+        <div className="panel metrics-bar" aria-label="Captured, processed, pending">
+          <span>Captured {status.captured_seconds ?? 0}s</span>
+          <span>
+            Processed {status.processed_chunks ?? 0} / {status.chunks ?? 0}
+          </span>
+          <span>Pending {status.pending_chunks ?? 0}</span>
+          <span>
+            Incidents {Object.values(status.incidents ?? {}).reduce((a, b) => a + b, 0)}
+          </span>
+        </div>
+      )}
+
+      {status?.attention && <p role="alert">{status.attention}</p>}
+
+      {status && terminal && status.result && (
+        <div className="panel" aria-label="Result">
+          <h2>Result</h2>
+          <p>{status.result.executive_summary}</p>
+          <ul>
+            {Object.entries(status.result.gates).map(([gate, verdict]) => (
+              <li key={gate} data-verdict={verdict}>
+                {gate}: {verdict}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </section>
+  );
+}

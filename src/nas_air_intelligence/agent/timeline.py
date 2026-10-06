@@ -215,6 +215,41 @@ def distribution(segments: list[TimelineSegment]) -> list[dict[str, Any]]:
     ]
 
 
+def current_material(
+    chunks: list[dict[str, Any]], events: list[dict[str, Any]]
+) -> dict[str, Any] | None:
+    """The most recently classified segment, for the desktop's "Current Material" panel.
+
+    Per Phase2.md section 15: SPEECH / SILENCE / UNKNOWN AUDIO only - never music, jingle,
+    promo, or ad. The transcript (when any) is the latest speech event inside that segment.
+    """
+    segments = build_timeline(chunks, events)
+    real = [s for s in segments if s.kind != "capture_gap"]
+    if not real:
+        return None
+    last = real[-1]
+    chunk_start = {c["id"]: parse_iso(c["started_at"]) for c in chunks}
+    text = None
+    for event in sorted(events, key=lambda e: float(e.get("start_offset", 0.0)), reverse=True):
+        start = chunk_start.get(event.get("chunk_id"))
+        if start is None or not event.get("text"):
+            continue
+        offset_start = start + timedelta(seconds=float(event["start_offset"]))
+        offset_end = start + timedelta(seconds=float(event["end_offset"]))
+        if offset_start < last.end and offset_end > last.start:
+            text = event["text"]
+            break
+    return {
+        "kind": last.kind,
+        "tier": last.tier,
+        "start": isoformat(last.start),
+        "end": isoformat(last.end),
+        "duration_seconds": round(last.duration_seconds, 1),
+        "confidence": last.mean_confidence,
+        "text": text,
+    }
+
+
 def recurrent_candidates(
     chunks: list[dict[str, Any]], events: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:

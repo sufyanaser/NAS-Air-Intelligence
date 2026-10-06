@@ -43,3 +43,76 @@ dt {
 dd {
   margin: 0;
 }
+
+.agent {
+  margin-top: 24px;
+}
+.start-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.start-form input,
+.start-form select {
+  padding: 6px 8px;
+  flex: 1 1 160px;
+}
+.start-form [role="alert"] {
+  color: #c0392b;
+  width: 100%;
+  margin: 4px 0 0;
+}
+.agent-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.panel {
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1px solid color-mix(in srgb, CanvasText 15%, transparent);
+}
+.panel h2 {
+  margin: 0 0 8px;
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+.state-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: color-mix(in srgb, CanvasText 10%, transparent);
+  font-weight: 600;
+}
+.timer {
+  font-variant-numeric: tabular-nums;
+}
+.activity-feed,
+.timeline-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.activity-feed li,
+.timeline-list li {
+  padding: 4px 0;
+  border-bottom: 1px solid color-mix(in srgb, CanvasText 8%, transparent);
+  font-size: 0.9rem;
+}
+.activity-feed li[data-severity="warn"] {
+  color: #b7791f;
+}
+.activity-feed li[data-severity="error"] {
+  color: #c0392b;
+}
+.metrics-bar {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 0.9rem;
+}

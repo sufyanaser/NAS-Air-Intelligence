@@ -33,6 +33,22 @@ CREATE TABLE IF NOT EXISTS agent_runs (
     updated_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_agent_runs_created ON agent_runs(created_at);
+
+-- Agent Run Journal: structured events the desktop activity feed reads. Never inferred by
+-- parsing stdout/stderr - every row here is written by the orchestrator at a known stage.
+CREATE TABLE IF NOT EXISTS agent_events (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+    session_id TEXT,
+    occurred_at TEXT NOT NULL,
+    stage TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    status TEXT NOT NULL,
+    message TEXT,
+    details_json TEXT NOT NULL DEFAULT '{}',
+    severity TEXT NOT NULL DEFAULT 'info'
+);
+CREATE INDEX IF NOT EXISTS idx_agent_events_run ON agent_events(run_id, occurred_at);
 """
 
 HEARTBEAT_STALE_SECONDS = 45.0
@@ -151,3 +167,55 @@ class AgentStore:
         if message not in warnings:
             warnings.append(message)
             self.update(run_id, warnings=warnings)
+
+    # ------------------------------------------------------------------ run journal
+    def log_event(
+        self,
+        run_id: str,
+        *,
+        stage: str,
+        event_type: str,
+        status: str = "ok",
+        message: str | None = None,
+        details: dict[str, Any] | None = None,
+        severity: str = "info",
+        session_id: str | None = None,
+    ) -> None:
+        """Append one Agent Run Journal row. The desktop activity feed reads these back."""
+        with self.db.connect() as conn:
+            conn.execute(
+                """INSERT INTO agent_events(
+                    id, run_id, session_id, occurred_at, stage, event_type,
+                    status, message, details_json, severity
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    str(uuid.uuid4()),
+                    run_id,
+                    session_id,
+                    isoformat(utc_now()),
+                    stage,
+                    event_type,
+                    status,
+                    message,
+                    json.dumps(details or {}, ensure_ascii=False),
+                    severity,
+                ),
+            )
+
+    def events(self, run_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        """Journal rows, newest first - exactly what an activity feed renders."""
+        rows = self.db.all(
+            "SELECT * FROM agent_events WHERE run_id=? ORDER BY occurred_at DESC, id DESC LIMIT ?",
+            (run_id, limit),
+        )
+        for row in rows:
+            row["details"] = json.loads(row.pop("details_json") or "{}")
+        return rows
+
+    def find(self, ident: str) -> dict[str, Any] | None:
+        """Look up a run by id, by its session id, or by an unambiguous id prefix."""
+        run = self.get(ident) or self.by_session(ident)
+        if run:
+            return run
+        matches = [r for r in self.all() if r["id"].startswith(ident)]
+        return matches[0] if len(matches) == 1 else None
