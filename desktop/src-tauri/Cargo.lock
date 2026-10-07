@@ -1937,7 +1937,7 @@ dependencies = [
 
 [[package]]
 name = "nas-air-desktop"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "getrandom 0.3.4",
  "serde",

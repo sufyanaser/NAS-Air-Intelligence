@@ -1,6 +1,6 @@
 [package]
 name = "nas-air-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "NAS Air Intelligence desktop control center"
 edition = "2021"
 rust-version = "1.82"
