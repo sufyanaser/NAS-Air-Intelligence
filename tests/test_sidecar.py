@@ -133,7 +133,9 @@ def test_default_storage_dir_is_per_user_not_cwd(monkeypatch, tmp_path: Path):
     monkeypatch.delenv("NAS_AIR_STORAGE", raising=False)
     monkeypatch.setattr(sidecar.sys, "platform", "win32")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
-    assert sidecar.default_storage_dir() == tmp_path / "NAS Air Intelligence"
+    storage = sidecar.default_storage_dir()
+    assert storage == tmp_path / "NAS Air Intelligence Data"
+    assert storage != tmp_path / "NAS Air Intelligence"  # that is the NSIS install directory
 
     monkeypatch.setenv("NAS_AIR_STORAGE", str(tmp_path / "override"))
     assert sidecar.default_storage_dir() == tmp_path / "override"

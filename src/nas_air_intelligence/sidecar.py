@@ -81,15 +81,21 @@ def default_storage_dir() -> Path:
     The CLI defaults to ``./data`` (fine for a terminal invoked from the repo). A frozen
     desktop sidecar has no meaningful "current directory" to anchor that to, so it defaults
     to a per-user application-data folder instead.
+
+    Deliberately NOT ``<LOCALAPPDATA>/NAS Air Intelligence`` on Windows: that is where the
+    NSIS installer puts the program itself (binaries, uninstaller), and an upgrade owns and
+    may wholesale replace that directory. Using a distinctly named sibling folder keeps data
+    outside the install directory (Phase2.md section 33 / 8), so an upgrade - or a reinstall -
+    cannot touch the database, recordings, or exports.
     """
     override = os.environ.get("NAS_AIR_STORAGE")
     if override:
         return Path(override)
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    else:
-        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(base) / "NAS Air Intelligence"
+        return Path(base) / "NAS Air Intelligence Data"
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "nas-air-intelligence"
 
 
 def default_db_path(storage: Path) -> Path:

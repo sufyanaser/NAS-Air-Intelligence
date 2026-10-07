@@ -18,7 +18,12 @@ New-Item -ItemType Directory -Force $work, $out | Out-Null
 if (-not (Test-Path "$venv\Scripts\python.exe")) { python -m venv $venv }
 $py = "$venv\Scripts\python.exe"
 & $py -m pip install --quiet --upgrade pip pyinstaller
-& $py -m pip install --quiet --no-deps --force-reinstall $root
+# No --no-deps: the sidecar imports openpyxl (and other base dependencies) eagerly, so pip
+# must actually install them into this venv for PyInstaller to find and bundle them. The
+# heavy, genuinely unused ones (fastapi/uvicorn/the ML stack) are kept out of the frozen
+# binary by the --exclude-module flags below regardless of what is installed here.
+& $py -m pip install --quiet --upgrade --force-reinstall --no-deps $root
+& $py -m pip install --quiet --upgrade $root
 
 & $py -m PyInstaller --noconfirm --clean --onefile --name "nas-air-sidecar" `
     --distpath "$work\dist" --workpath "$work\build" --specpath $work `

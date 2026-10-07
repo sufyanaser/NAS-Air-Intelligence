@@ -1,16 +1,23 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  confirmExitKeepMonitoring,
+  confirmExitStopAndQuit,
+  exportAgentExcel,
   fetchAgentJournal,
+  fetchAgentProgramming,
   fetchAgentResult,
   fetchAgentStatus,
   fetchAgentTimeline,
   isTerminal,
   onAgentEvent,
+  onConfirmExit,
+  setMonitoringActive,
   startAgent,
   stopAgent,
   watchAgent,
   type AgentChangedEvent,
   type AgentStatus,
+  type ConfirmExitEvent,
   type JournalEvent,
   type TimelineResponse,
 } from "./agent";
@@ -44,8 +51,14 @@ interface Api {
   result: typeof fetchAgentResult;
   timeline: typeof fetchAgentTimeline;
   journal: typeof fetchAgentJournal;
+  programming: typeof fetchAgentProgramming;
+  exportExcel: typeof exportAgentExcel;
   watch: typeof watchAgent;
   onEvent: typeof onAgentEvent;
+  setActive: typeof setMonitoringActive;
+  onConfirmExit: typeof onConfirmExit;
+  confirmKeep: typeof confirmExitKeepMonitoring;
+  confirmStopAndQuit: typeof confirmExitStopAndQuit;
 }
 
 const defaultApi: Api = {
@@ -55,8 +68,14 @@ const defaultApi: Api = {
   result: fetchAgentResult,
   timeline: fetchAgentTimeline,
   journal: fetchAgentJournal,
+  programming: fetchAgentProgramming,
+  exportExcel: exportAgentExcel,
   watch: watchAgent,
   onEvent: onAgentEvent,
+  setActive: setMonitoringActive,
+  onConfirmExit,
+  confirmKeep: confirmExitKeepMonitoring,
+  confirmStopAndQuit: confirmExitStopAndQuit,
 };
 
 interface AgentPanelProps {
@@ -79,8 +98,12 @@ export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: Agent
   const [journal, setJournal] = useState<JournalEvent[]>([]);
   const [formError, setFormError] = useState<string | null>(null);
   const [starting, setStarting] = useState(false);
+  const [programming, setProgramming] = useState<Record<string, unknown> | null>(null);
+  const [exportNote, setExportNote] = useState<string | null>(null);
+  const [exitPrompt, setExitPrompt] = useState<string | null>(null); // run id, or null if hidden
   const runIdRef = useRef(runId);
   runIdRef.current = runId;
+  const selfHealedRef = useRef<string | null>(null); // run id we already auto-recovered once
 
   const refresh = async (id: string) => {
     try {
@@ -96,12 +119,32 @@ export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: Agent
         setTimeline(nextTimeline);
         setJournal(nextJournal.events);
       }
-    } catch (error) {
-      if (runIdRef.current === id) {
-        setStatus((prev) =>
-          prev ? { ...prev, attention: error instanceof Error ? error.message : String(error) } : prev,
-        );
+      // Worker-crash self-heal: `attention` means the worker stopped reporting a heartbeat.
+      // `stop` on an unresponsive run recovers it (finalizes what was captured) exactly like
+      // an operator running `nas-air agent stop` would - done at most once per run so a
+      // genuinely stuck sidecar cannot retry forever.
+      if (
+        nextStatus.attention &&
+        !isTerminal(nextStatus.state) &&
+        selfHealedRef.current !== id
+      ) {
+        selfHealedRef.current = id;
+        void api.stop(id).then(() => refresh(id));
       }
+    } catch (error) {
+      if (runIdRef.current !== id) return;
+      setStatus((prev) => {
+        if (prev) {
+          return { ...prev, attention: error instanceof Error ? error.message : String(error) };
+        }
+        // The very first fetch for a persisted run id failed (e.g. the backend's data was
+        // reset, or the id is stale): resuming it can never succeed, and leaving `status`
+        // null forever would blank the screen with no Start form and no visible error.
+        // Fall back to a fresh Start instead of resuming a run that no longer exists.
+        writeLastRunId(null);
+        setRunId(null);
+        return null;
+      });
     }
   };
 
@@ -132,6 +175,23 @@ export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: Agent
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Rust's window-close handler only knows what we tell it: whenever "active" (started, not
+  // yet terminal) changes, we push it over so quitting can ask "keep monitoring / stop and
+  // quit / cancel" instead of silently killing an active run.
+  const active = status ? !isTerminal(status.state) : false;
+  useEffect(() => {
+    void api.setActive(active && runId ? runId : null);
+  }, [api, active, runId]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void api.onConfirmExit((event: ConfirmExitEvent) => setExitPrompt(event.run_id)).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const handleStart = async (form: FormData) => {
     setFormError(null);
     const station = String(form.get("station") || "").trim();
@@ -154,6 +214,9 @@ export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: Agent
       setStatus(null);
       setTimeline(null);
       setJournal([]);
+      setProgramming(null);
+      setExportNote(null);
+      selfHealedRef.current = null;
       setRunId(result.run_id);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : String(error));
@@ -172,8 +235,37 @@ export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: Agent
     }
   };
 
+  const handleViewProgramming = async () => {
+    if (!runId) return;
+    try {
+      setProgramming(await api.programming(runId));
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const handleExport = async () => {
+    if (!runId) return;
+    try {
+      const ack = await api.exportExcel(runId);
+      setExportNote(`Export started - writing to ${ack.export_dir}`);
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const handleExitChoice = async (choice: "keep" | "stop" | "cancel") => {
+    const id = exitPrompt;
+    setExitPrompt(null);
+    if (!id || choice === "cancel") return;
+    if (choice === "keep") await api.confirmKeep();
+    else await api.confirmStopAndQuit(id);
+  };
+
   const terminal = status ? isTerminal(status.state) : false;
   const showStartForm = !runId || terminal;
+  const exportCreated = journal.find((e) => e.event_type === "EXPORT_CREATED");
+  const exportFailed = journal.find((e) => e.event_type === "EXPORT_FAILED");
 
   return (
     <section className="agent" aria-label="Monitoring agent">
@@ -299,6 +391,57 @@ export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: Agent
               </li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {status && terminal && status.session_id && (
+        <div className="panel" aria-label="Study tools">
+          <h2>Study Tools</h2>
+          <div className="study-actions">
+            <button type="button" onClick={() => void handleViewProgramming()}>
+              View Programming Intelligence
+            </button>
+            <button type="button" onClick={() => void handleExport()}>
+              Export Excel
+            </button>
+          </div>
+          {exportNote && !exportCreated && !exportFailed && <p role="status">{exportNote}</p>}
+          {exportCreated && <p role="status">Export complete: {exportCreated.message}</p>}
+          {exportFailed && <p role="alert">Export failed: {exportFailed.message}</p>}
+          {programming && (
+            <dl className="study-summary">
+              {Object.entries(
+                (programming.study_summary as Record<string, unknown>) ?? {},
+              ).map(([key, value]) => (
+                <div key={key}>
+                  <dt>{key.replaceAll("_", " ")}</dt>
+                  <dd>{String(value)}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+        </div>
+      )}
+
+      {exitPrompt && (
+        <div className="modal-backdrop" role="dialog" aria-label="Active monitoring">
+          <div className="modal">
+            <p>
+              A monitoring run is still active. What would you like to do before closing NAS Air
+              Intelligence?
+            </p>
+            <div className="modal-actions">
+              <button type="button" onClick={() => void handleExitChoice("keep")}>
+                Keep monitoring in background
+              </button>
+              <button type="button" onClick={() => void handleExitChoice("stop")}>
+                Stop monitoring and quit
+              </button>
+              <button type="button" onClick={() => void handleExitChoice("cancel")}>
+                Cancel
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>
