@@ -39,16 +39,35 @@ class PreflightCheckStatus(StrEnum):
     SKIPPED = "SKIPPED"
 
 
+class PreflightReasonCode(StrEnum):
+    STREAM_UNRESOLVABLE = "STREAM_UNRESOLVABLE"
+    FFMPEG_MISSING = "FFMPEG_MISSING"
+    FFPROBE_MISSING = "FFPROBE_MISSING"
+    STORAGE_INSUFFICIENT = "STORAGE_INSUFFICIENT"
+    DATABASE_INACCESSIBLE = "DATABASE_INACCESSIBLE"
+    TRANSCRIPTION_ENGINE_MISSING = "TRANSCRIPTION_ENGINE_MISSING"
+    MODEL_LOAD_FAILED = "MODEL_LOAD_FAILED"
+    DEVICE_UNAVAILABLE = "DEVICE_UNAVAILABLE"
+    COMPUTE_TYPE_UNSUPPORTED = "COMPUTE_TYPE_UNSUPPORTED"
+    SAMPLE_TRANSCRIPTION_FAILED = "SAMPLE_TRANSCRIPTION_FAILED"
+
+
 @dataclass
 class PreflightCheckResult:
     check_name: str
     status: PreflightCheckStatus
     detail: str
+    reason_code: PreflightReasonCode | str | None = None
     metrics: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["status"] = self.status.value
+        data["reason_code"] = (
+            self.reason_code.value
+            if isinstance(self.reason_code, PreflightReasonCode)
+            else self.reason_code
+        )
         return data
 
 
@@ -59,6 +78,7 @@ class PreflightReport:
     blocked: bool
     checks: list[PreflightCheckResult]
     failures: list[str] = field(default_factory=list)
+    reason_codes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -67,6 +87,7 @@ class PreflightReport:
             "blocked": self.blocked,
             "checks": [c.to_dict() for c in self.checks],
             "failures": self.failures,
+            "reason_codes": self.reason_codes,
         }
 
 
@@ -116,6 +137,7 @@ class PreflightChecker:
     ) -> PreflightReport:
         checks: list[PreflightCheckResult] = []
         failures: list[str] = []
+        reason_codes: list[str] = []
 
         # 1. FFmpeg
         ffmpeg_path = shutil.which(self.ffmpeg)
@@ -134,16 +156,40 @@ class PreflightChecker:
                     )
                 else:
                     msg = f"ffmpeg returned exit code {res.returncode}"
-                    checks.append(PreflightCheckResult("ffmpeg", PreflightCheckStatus.FAIL, msg))
+                    checks.append(
+                        PreflightCheckResult(
+                            "ffmpeg",
+                            PreflightCheckStatus.FAIL,
+                            msg,
+                            reason_code=PreflightReasonCode.FFMPEG_MISSING.value,
+                        )
+                    )
                     failures.append(msg)
+                    reason_codes.append(PreflightReasonCode.FFMPEG_MISSING.value)
             except Exception as exc:
                 msg = f"ffmpeg execution failed: {exc}"
-                checks.append(PreflightCheckResult("ffmpeg", PreflightCheckStatus.FAIL, msg))
+                checks.append(
+                    PreflightCheckResult(
+                        "ffmpeg",
+                        PreflightCheckStatus.FAIL,
+                        msg,
+                        reason_code=PreflightReasonCode.FFMPEG_MISSING.value,
+                    )
+                )
                 failures.append(msg)
+                reason_codes.append(PreflightReasonCode.FFMPEG_MISSING.value)
         else:
             msg = f"ffmpeg executable not found in PATH ({self.ffmpeg})"
-            checks.append(PreflightCheckResult("ffmpeg", PreflightCheckStatus.FAIL, msg))
+            checks.append(
+                PreflightCheckResult(
+                    "ffmpeg",
+                    PreflightCheckStatus.FAIL,
+                    msg,
+                    reason_code=PreflightReasonCode.FFMPEG_MISSING.value,
+                )
+            )
             failures.append(msg)
+            reason_codes.append(PreflightReasonCode.FFMPEG_MISSING.value)
 
         # 2. FFprobe
         ffprobe_path = shutil.which(self.ffprobe)
@@ -155,8 +201,16 @@ class PreflightChecker:
             )
         else:
             msg = f"ffprobe executable not found in PATH ({self.ffprobe})"
-            checks.append(PreflightCheckResult("ffprobe", PreflightCheckStatus.FAIL, msg))
+            checks.append(
+                PreflightCheckResult(
+                    "ffprobe",
+                    PreflightCheckStatus.FAIL,
+                    msg,
+                    reason_code=PreflightReasonCode.FFPROBE_MISSING.value,
+                )
+            )
             failures.append(msg)
+            reason_codes.append(PreflightReasonCode.FFPROBE_MISSING.value)
 
         # 3. Storage
         try:
@@ -168,21 +222,37 @@ class PreflightChecker:
             free_mib = free_bytes / (1024 * 1024)
             if free_bytes < MIN_FREE_DISK_BYTES:
                 msg = f"Low disk space: {free_mib:.0f} MiB free (requires >= 500 MiB)"
-                checks.append(PreflightCheckResult("storage", PreflightCheckStatus.FAIL, msg))
+                checks.append(
+                    PreflightCheckResult(
+                        "storage",
+                        PreflightCheckStatus.FAIL,
+                        msg,
+                        reason_code=PreflightReasonCode.STORAGE_INSUFFICIENT.value,
+                    )
+                )
                 failures.append(msg)
+                reason_codes.append(PreflightReasonCode.STORAGE_INSUFFICIENT.value)
             else:
                 checks.append(
                     PreflightCheckResult(
                         "storage",
                         PreflightCheckStatus.PASS,
                         f"writable, {free_mib:.0f} MiB free",
-                        {"free_bytes": free_bytes},
+                        metrics={"free_bytes": free_bytes},
                     )
                 )
         except Exception as exc:
             msg = f"storage verification failed for {self.storage_dir}: {exc}"
-            checks.append(PreflightCheckResult("storage", PreflightCheckStatus.FAIL, msg))
+            checks.append(
+                PreflightCheckResult(
+                    "storage",
+                    PreflightCheckStatus.FAIL,
+                    msg,
+                    reason_code=PreflightReasonCode.STORAGE_INSUFFICIENT.value,
+                )
+            )
             failures.append(msg)
+            reason_codes.append(PreflightReasonCode.STORAGE_INSUFFICIENT.value)
 
         # 4. Database
         if self.db is not None:
@@ -195,8 +265,16 @@ class PreflightChecker:
                 )
             except Exception as exc:
                 msg = f"database connection/init failed: {exc}"
-                checks.append(PreflightCheckResult("database", PreflightCheckStatus.FAIL, msg))
+                checks.append(
+                    PreflightCheckResult(
+                        "database",
+                        PreflightCheckStatus.FAIL,
+                        msg,
+                        reason_code=PreflightReasonCode.DATABASE_INACCESSIBLE.value,
+                    )
+                )
                 failures.append(msg)
+                reason_codes.append(PreflightReasonCode.DATABASE_INACCESSIBLE.value)
         else:
             checks.append(
                 PreflightCheckResult(
@@ -220,24 +298,38 @@ class PreflightChecker:
                     err = resolved.details.get("error", "stream verification failed")
                     msg = f"stream resolution failed: {err}"
                     checks.append(
-                        PreflightCheckResult("stream_resolution", PreflightCheckStatus.FAIL, msg)
+                        PreflightCheckResult(
+                            "stream_resolution",
+                            PreflightCheckStatus.FAIL,
+                            msg,
+                            reason_code=PreflightReasonCode.STREAM_UNRESOLVABLE.value,
+                        )
                     )
                     failures.append(msg)
+                    reason_codes.append(PreflightReasonCode.STREAM_UNRESOLVABLE.value)
             except Exception as exc:
                 msg = f"stream resolver error: {exc}"
                 checks.append(
-                    PreflightCheckResult("stream_resolution", PreflightCheckStatus.FAIL, msg)
+                    PreflightCheckResult(
+                        "stream_resolution",
+                        PreflightCheckStatus.FAIL,
+                        msg,
+                        reason_code=PreflightReasonCode.STREAM_UNRESOLVABLE.value,
+                    )
                 )
                 failures.append(msg)
+                reason_codes.append(PreflightReasonCode.STREAM_UNRESOLVABLE.value)
 
         # Analysis Dependency Checks (only required in CAPTURE_AND_ANALYSIS mode)
         if mode == PreflightMode.CAPTURE_AND_ANALYSIS and analyzer == "whisper":
             transcriber = None
+            engine_installed = False
 
             # 6. Transcription Engine Import
             try:
                 from faster_whisper import WhisperModel  # noqa: F401
 
+                engine_installed = True
                 checks.append(
                     PreflightCheckResult(
                         "transcription_engine",
@@ -248,12 +340,18 @@ class PreflightChecker:
             except ImportError as exc:
                 msg = f"faster-whisper is not installed: {exc}"
                 checks.append(
-                    PreflightCheckResult("transcription_engine", PreflightCheckStatus.FAIL, msg)
+                    PreflightCheckResult(
+                        "transcription_engine",
+                        PreflightCheckStatus.FAIL,
+                        msg,
+                        reason_code=PreflightReasonCode.TRANSCRIPTION_ENGINE_MISSING.value,
+                    )
                 )
                 failures.append(msg)
+                reason_codes.append(PreflightReasonCode.TRANSCRIPTION_ENGINE_MISSING.value)
 
             # 7 & 8 & 9. Model loading, Device, Compute Type
-            if not failures or not any("faster-whisper" in f for f in failures):
+            if engine_installed:
                 try:
                     from ..transcription import SpeechTranscriber, TranscriptionConfig
 
@@ -268,7 +366,7 @@ class PreflightChecker:
                             "model_loading",
                             PreflightCheckStatus.PASS,
                             f"model '{cfg.model_size_or_path}' loaded",
-                            {"device": device, "compute_type": compute_type},
+                            metrics={"device": device, "compute_type": compute_type},
                         )
                     )
                     checks.append(
@@ -284,9 +382,23 @@ class PreflightChecker:
                 except Exception as exc:
                     msg = f"Whisper model loading failed: {exc}"
                     checks.append(
-                        PreflightCheckResult("model_loading", PreflightCheckStatus.FAIL, msg)
+                        PreflightCheckResult(
+                            "model_loading",
+                            PreflightCheckStatus.FAIL,
+                            msg,
+                            reason_code=PreflightReasonCode.MODEL_LOAD_FAILED.value,
+                        )
                     )
                     failures.append(msg)
+                    reason_codes.append(PreflightReasonCode.MODEL_LOAD_FAILED.value)
+            else:
+                checks.append(
+                    PreflightCheckResult(
+                        "model_loading",
+                        PreflightCheckStatus.SKIPPED,
+                        "skipped: transcription engine missing",
+                    )
+                )
 
             # 10. Short Real Audio Sample Transcription Test
             if transcriber is not None and not any("model" in f.lower() for f in failures):
@@ -301,10 +413,16 @@ class PreflightChecker:
                             msg = f"Sample transcription failed: {err}"
                             checks.append(
                                 PreflightCheckResult(
-                                    "short_sample_test", PreflightCheckStatus.FAIL, msg
+                                    "short_sample_test",
+                                    PreflightCheckStatus.FAIL,
+                                    msg,
+                                    reason_code=PreflightReasonCode.SAMPLE_TRANSCRIPTION_FAILED.value,
                                 )
                             )
                             failures.append(msg)
+                            reason_codes.append(
+                                PreflightReasonCode.SAMPLE_TRANSCRIPTION_FAILED.value
+                            )
                         else:
                             checks.append(
                                 PreflightCheckResult(
@@ -319,9 +437,15 @@ class PreflightChecker:
                 except Exception as exc:
                     msg = f"Sample transcription test failed: {exc}"
                     checks.append(
-                        PreflightCheckResult("short_sample_test", PreflightCheckStatus.FAIL, msg)
+                        PreflightCheckResult(
+                            "short_sample_test",
+                            PreflightCheckStatus.FAIL,
+                            msg,
+                            reason_code=PreflightReasonCode.SAMPLE_TRANSCRIPTION_FAILED.value,
+                        )
                     )
                     failures.append(msg)
+                    reason_codes.append(PreflightReasonCode.SAMPLE_TRANSCRIPTION_FAILED.value)
         else:
             checks.append(
                 PreflightCheckResult(
@@ -340,6 +464,7 @@ class PreflightChecker:
             blocked=blocked,
             checks=checks,
             failures=failures,
+            reason_codes=reason_codes,
         )
 
 

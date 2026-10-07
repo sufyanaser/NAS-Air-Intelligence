@@ -10,15 +10,17 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from nas_air_intelligence.agent.excel_export import write_workbook
 from nas_air_intelligence.agent.preflight import (
     PreflightChecker,
+    PreflightCheckStatus,
     PreflightError,
     PreflightMode,
+    PreflightReasonCode,
     verify_preflight_or_raise,
 )
 from nas_air_intelligence.agent.programming import (
@@ -95,6 +97,10 @@ def test_red_team_fixture_1_faster_whisper_missing(tmp_path: Path):
         )
         assert report.blocked is True
         assert any("faster-whisper" in f for f in report.failures)
+        assert PreflightReasonCode.TRANSCRIPTION_ENGINE_MISSING in report.reason_codes
+        engine_check = next(c for c in report.checks if c.check_name == "transcription_engine")
+        assert engine_check.status == PreflightCheckStatus.FAIL
+        assert engine_check.reason_code == PreflightReasonCode.TRANSCRIPTION_ENGINE_MISSING
 
         with pytest.raises(PreflightError) as exc_info:
             verify_preflight_or_raise(
@@ -113,7 +119,8 @@ def test_red_team_fixture_2_model_load_failure(tmp_path: Path):
     """Whisper model load crash blocks CAPTURE_AND_ANALYSIS start and marks validity as FAILED."""
     checker = PreflightChecker(storage_dir=tmp_path / "storage")
 
-    with patch(
+    mock_fw = MagicMock()
+    with patch.dict("sys.modules", {"faster_whisper": mock_fw}), patch(
         "nas_air_intelligence.transcription.SpeechTranscriber._load_model",
         side_effect=RuntimeError("CUDA out of memory / model load failed"),
     ):
@@ -122,7 +129,35 @@ def test_red_team_fixture_2_model_load_failure(tmp_path: Path):
             analyzer="whisper",
         )
         assert report.blocked is True
+        assert PreflightReasonCode.MODEL_LOAD_FAILED in report.reason_codes
+        model_check = next(c for c in report.checks if c.check_name == "model_loading")
+        assert model_check.status == PreflightCheckStatus.FAIL
+        assert model_check.reason_code == PreflightReasonCode.MODEL_LOAD_FAILED
         assert any("model loading failed" in f.lower() for f in report.failures)
+
+
+# ==============================================================================
+# RED TEAM FIXTURE: CUDA / device initialization failure
+# ==============================================================================
+def test_red_team_fixture_cuda_initialization_failure(tmp_path: Path):
+    """CUDA device initialization failure produces MODEL_LOAD_FAILED and blocks start."""
+    checker = PreflightChecker(storage_dir=tmp_path / "storage")
+
+    mock_fw = MagicMock()
+    with patch.dict("sys.modules", {"faster_whisper": mock_fw}), patch(
+        "nas_air_intelligence.transcription.SpeechTranscriber._load_model",
+        side_effect=RuntimeError("CUDA failed with error: no CUDA-capable device is detected"),
+    ):
+        report = checker.run_preflight(
+            mode=PreflightMode.CAPTURE_AND_ANALYSIS,
+            analyzer="whisper",
+        )
+        assert report.blocked is True
+        assert PreflightReasonCode.MODEL_LOAD_FAILED in report.reason_codes
+        model_check = next(c for c in report.checks if c.check_name == "model_loading")
+        assert model_check.status == PreflightCheckStatus.FAIL
+        assert model_check.reason_code == PreflightReasonCode.MODEL_LOAD_FAILED
+        assert any("cuda" in f.lower() for f in report.failures)
 
 
 # ==============================================================================
