@@ -2,7 +2,7 @@ import { formatCalmDuration, isArabicText } from "./formatters";
 import type { AgentStatus, JournalEvent, TimelineResponse } from "../agent";
 
 interface OverviewViewProps {
-  status: AgentStatus;
+  status: AgentStatus | null;
   timeline: TimelineResponse | null;
   journal: JournalEvent[];
   terminal: boolean;
@@ -24,6 +24,136 @@ export default function OverviewView({
   programming,
   exportNote,
 }: OverviewViewProps) {
+  if (!status) {
+    return (
+      <div className="overview-ready-container" aria-label="Broadcast intelligence overview">
+        <div className="ready-workflow-header">
+          <div className="workflow-title-block">
+            <h2>Broadcast Intelligence Workflow</h2>
+            <p className="workflow-subtitle">
+              Continuous monitoring, evidence extraction, and programming intelligence for NAS FM.
+            </p>
+          </div>
+          <div className="workflow-status-badge">
+            <span className="pulse-dot-green" />
+            <span>STANDBY · READY TO MONITOR</span>
+          </div>
+        </div>
+
+        {/* 4 Pipeline Architecture Cards */}
+        <div className="workflow-pipeline-grid">
+          <div className="workflow-stage-card">
+            <div className="stage-header">
+              <span className="stage-step-tag">STAGE 1</span>
+              <span className="stage-badge-stream">MONITORING</span>
+            </div>
+            <h3>Radio Stream Ingestion</h3>
+            <p>Ingests live streams (HLS, MP3, AAC) with automatic web discovery, reconnect resilience, and zero dropouts.</p>
+            <ul className="stage-features">
+              <li>Auto stream resolution</li>
+              <li>Win32 Job Object containment</li>
+              <li>Incident tracking & retry</li>
+            </ul>
+          </div>
+
+          <div className="workflow-stage-card">
+            <div className="stage-header">
+              <span className="stage-step-tag">STAGE 2</span>
+              <span className="stage-badge-timeline">TIMELINE</span>
+            </div>
+            <h3>Evidence Timeline</h3>
+            <p>Builds an absolute-time chronological timeline using chunked Whisper speech transcription and silence detection.</p>
+            <ul className="stage-features">
+              <li>OpenAI Whisper AI engine</li>
+              <li>Native Arabic RTL support</li>
+              <li>Chronological alignment</li>
+            </ul>
+          </div>
+
+          <div className="workflow-stage-card">
+            <div className="stage-header">
+              <span className="stage-step-tag">STAGE 3</span>
+              <span className="stage-badge-intel">INTELLIGENCE</span>
+            </div>
+            <h3>Programming Structure</h3>
+            <p>Analyzes broadcast patterns to detect program candidates, daypart blocks, and music vs. speech ratios.</p>
+            <ul className="stage-features">
+              <li>Content block modeling</li>
+              <li>Program candidate extraction</li>
+              <li>Clock pattern analysis</li>
+            </ul>
+          </div>
+
+          <div className="workflow-stage-card">
+            <div className="stage-header">
+              <span className="stage-step-tag">STAGE 4</span>
+              <span className="stage-badge-export">REPORTS</span>
+            </div>
+            <h3>NAS FM Planning & Export</h3>
+            <p>Generates executive intelligence summaries, quality gates, and structured multi-sheet Excel workbooks.</p>
+            <ul className="stage-features">
+              <li>Strict observed vs planning separation</li>
+              <li>Audit-ready Excel export</li>
+              <li>Actionable planning inputs</li>
+            </ul>
+          </div>
+        </div>
+
+        {/* Bottom Split: Presets and Telemetry */}
+        <div className="ready-bottom-grid">
+          <div className="panel preset-panel">
+            <div className="panel-header-inline">
+              <h2>Station Targets & Quick Presets</h2>
+              <span className="panel-tag">Quick Fill</span>
+            </div>
+            <p className="preset-intro">Verified radio station profiles ready for immediate operational monitoring:</p>
+            <div className="preset-cards-list">
+              <div className="preset-card">
+                <div className="preset-info">
+                  <span className="preset-name">Al Nakhla FM (إذاعة النخلة)</span>
+                  <span className="preset-meta">https://www.al-nakhla.net/ar/radio · Arabic Speech · 128 kbps MP3</span>
+                </div>
+                <span className="preset-status-tag verified">VERIFIED STREAM</span>
+              </div>
+              <div className="preset-card">
+                <div className="preset-info">
+                  <span className="preset-name">Monte Carlo Doualiya</span>
+                  <span className="preset-meta">https://live02.mc-doualiya.com/mc-doualiya.mp3 · News & Talk · AAC</span>
+                </div>
+                <span className="preset-status-tag verified">VERIFIED STREAM</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="panel telemetry-panel">
+            <div className="panel-header-inline">
+              <h2>Operational Telemetry</h2>
+              <span className="panel-tag">System State</span>
+            </div>
+            <dl className="telemetry-list">
+              <div>
+                <dt>Sidecar Isolation</dt>
+                <dd>Win32 Job Object (Kill-on-Close)</dd>
+              </div>
+              <div>
+                <dt>Speech Analyzer</dt>
+                <dd>Whisper AI (Offline Transcription)</dd>
+              </div>
+              <div>
+                <dt>Persistence</dt>
+                <dd>Local SQLite WAL Database</dd>
+              </div>
+              <div>
+                <dt>Audio Segmenter</dt>
+                <dd>FFmpeg segmenter (zero dropouts)</dd>
+              </div>
+            </dl>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const exportCreated = journal.find((e) => e.event_type === "EXPORT_CREATED");
   const exportFailed = journal.find((e) => e.event_type === "EXPORT_FAILED");
 

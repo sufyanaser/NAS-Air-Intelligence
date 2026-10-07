@@ -25,47 +25,51 @@ export default function App({ fetcher = fetchSidecarHealth, intervalMs }: AppPro
   return (
     <ThemeProvider>
       <div className="app-shell">
-        {/* TopBar with purpose statement, calm timer, health & theme toggles */}
+        {/* Zone 1: Single compact horizontal TopBar */}
         <TopBar
+          healthState={state}
           onOpenDiagnostics={() => setDiagnosticsOpen(true)}
-          onOpenUpdates={() => setUpdatesOpen((v) => !v)}
+          onOpenUpdates={() => setUpdatesOpen(true)}
         />
 
-        <main className="shell">
-          <div className="visually-hidden">
-            <h1>NAS Air Intelligence</h1>
-            <p className="subtitle">Radio monitoring control center</p>
-          </div>
-
-          {/* Engine status indicator (satisfies App.test.tsx and runtime status) */}
-          <section
-            aria-label="Engine status"
-            className={`status status-${state.phase} compact-engine-bar`}
-          >
-            {state.phase === "starting" && <p role="status">Starting analysis engine…</p>}
-            {state.phase === "ready" && (
-              <div className="engine-ready-row">
-                <span className="pulse-dot-green" />
-                <p role="status" className="engine-status-text">Engine ready</p>
-                <dl className="engine-meta-list">
-                  <dt>Core version</dt>
-                  <dd>{state.health.version}</dd>
-                  <dt>Python</dt>
-                  <dd>{state.health.python}</dd>
-                  <dt>FFmpeg</dt>
-                  <dd>{state.health.ffmpeg && state.health.ffprobe ? "found" : "not found"}</dd>
-                </dl>
+        {/* Update Modal Dialog */}
+        {updatesOpen && (
+          <div className="modal-backdrop" onClick={() => setUpdatesOpen(false)}>
+            <div
+              className="modal-card update-modal"
+              onClick={(e) => e.stopPropagation()}
+              role="dialog"
+              aria-label="Software Updates"
+            >
+              <div className="modal-header">
+                <h3>Software Updates</h3>
+                <button
+                  type="button"
+                  className="btn-modal-close"
+                  onClick={() => setUpdatesOpen(false)}
+                  aria-label="Close updates"
+                >
+                  ✕
+                </button>
               </div>
-            )}
-            {state.phase === "failed" && <p role="alert">Engine unavailable: {state.error}</p>}
-          </section>
-
-          {/* Software Updater surface */}
-          <div className={`updater-container ${updatesOpen ? "open" : ""}`}>
-            <UpdatePanel />
+              <UpdatePanel />
+            </div>
           </div>
+        )}
 
-          {/* Active Monitoring Agent Workspace */}
+        {/* Zone 2 & 3: Main Workspace */}
+        <main className="workspace-main">
+          {state.phase === "failed" && (
+            <div className="engine-error-banner" role="alert">
+              <strong>Engine unavailable:</strong> {state.error}
+            </div>
+          )}
+          {state.phase === "starting" && (
+            <div className="engine-starting-state">
+              <div className="starting-spinner" />
+              <p role="status">Starting analysis engine…</p>
+            </div>
+          )}
           {state.phase === "ready" && <AgentPanel />}
         </main>
 
