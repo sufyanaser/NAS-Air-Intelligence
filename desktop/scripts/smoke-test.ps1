@@ -63,6 +63,8 @@ Write-Host "launched pid $($app.Id)"
 # 1) wait for the UI to report ready (React rendered + sidecar health = ready)
 $cdp = @'
 import json, sys, time, urllib.request
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from websockets.sync.client import connect
 port = sys.argv[1]
 deadline = time.time() + 60
