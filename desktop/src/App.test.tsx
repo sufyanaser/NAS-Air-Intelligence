@@ -7,6 +7,7 @@ import { waitForSidecar, type SidecarHealth } from "./health";
 // AgentPanel - which calls the Tauri event/invoke bridge that does not exist under jsdom -
 // is replaced with an inert stub here.
 vi.mock("./AgentPanel", () => ({ default: () => <div data-testid="agent-panel-stub" /> }));
+vi.mock("./UpdatePanel", () => ({ default: () => <div data-testid="update-panel-stub" /> }));
 
 const ready: SidecarHealth = {
   status: "ready",

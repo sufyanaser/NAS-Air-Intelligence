@@ -163,6 +163,20 @@ pub struct Sidecar {
 }
 
 impl Sidecar {
+    /// False once the sidecar process has exited on its own (crash, or killed outside our
+    /// control) - used by the supervisor thread to decide whether to restart it.
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(None))
+    }
+
+    /// The raw process handle, for assigning this specific process to the containment job
+    /// (see job.rs) - never the handle of anything this process itself later spawns.
+    #[cfg(windows)]
+    pub fn raw_handle(&self) -> std::os::windows::io::RawHandle {
+        use std::os::windows::io::AsRawHandle;
+        self.child.as_raw_handle()
+    }
+
     /// Ask nicely, wait briefly, then kill. The job object is the final backstop.
     pub fn shutdown(&mut self) {
         let _ = http_request(self.port, "POST", "/shutdown", &self.token);
