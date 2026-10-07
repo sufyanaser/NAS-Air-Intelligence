@@ -1,0 +1,305 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "NASAirIntelligenceAnalysis",
+  "description": "Schema for NAS Air Intelligence broadcast analytical exports",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generator",
+    "session",
+    "status",
+    "environment",
+    "quality",
+    "capture_metrics",
+    "analysis_metrics",
+    "timeline",
+    "content_blocks",
+    "program_candidates",
+    "clock_patterns",
+    "dayparts",
+    "recurrent_elements",
+    "programming_intelligence",
+    "incidents"
+  ],
+  "properties": {
+    "schema_version": { "type": ["integer", "string"] },
+    "generator": {
+      "type": "object",
+      "required": ["app", "version"],
+      "properties": {
+        "app": { "type": "string" },
+        "version": { "type": "string" },
+        "generated_at": { "type": "string" }
+      }
+    },
+    "session": {
+      "type": "object",
+      "required": ["id", "station", "started_at", "requested_seconds", "timezone"],
+      "properties": {
+        "id": { "type": "string" },
+        "station": { "type": "string" },
+        "stream_url": { "type": ["string", "null"] },
+        "started_at": { "type": "string" },
+        "ended_at": { "type": ["string", "null"] },
+        "requested_seconds": { "type": "number" },
+        "timezone": { "type": "string" }
+      }
+    },
+    "status": {
+      "type": "object",
+      "required": [
+        "capture_status",
+        "processing_status",
+        "transcription_status",
+        "classification_status",
+        "programming_analysis_status",
+        "decision_readiness"
+      ],
+      "properties": {
+        "capture_status": {
+          "type": "string",
+          "enum": ["NOT_STARTED", "CAPTURING", "COMPLETED", "FAILED", "STOPPED"]
+        },
+        "processing_status": {
+          "type": "string",
+          "enum": ["NOT_STARTED", "PROCESSING", "COMPLETED", "DEGRADED", "FAILED", "UNAVAILABLE"]
+        },
+        "transcription_status": {
+          "type": "string",
+          "enum": ["NOT_STARTED", "COMPLETED", "DEGRADED", "FAILED", "UNAVAILABLE", "SKIPPED"]
+        },
+        "classification_status": {
+          "type": "string",
+          "enum": ["NOT_STARTED", "COMPLETED", "LIMITED", "UNAVAILABLE", "FAILED"]
+        },
+        "programming_analysis_status": {
+          "type": "string",
+          "enum": ["NOT_STARTED", "COMPLETED", "LIMITED", "BLOCKED", "FAILED", "INSUFFICIENT_SAMPLE"]
+        },
+        "decision_readiness": {
+          "type": "string",
+          "enum": ["READY", "LIMITED", "NOT_READY"]
+        },
+        "reasons": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "environment": {
+      "type": "object",
+      "properties": {
+        "python": { "type": ["string", "null"] },
+        "model": { "type": ["string", "null"] },
+        "device": { "type": ["string", "null"] },
+        "compute_type": { "type": ["string", "null"] },
+        "ffmpeg": { "type": ["string", "boolean", "null"] }
+      }
+    },
+    "quality": {
+      "type": "object",
+      "required": ["gates", "warnings", "limitations"],
+      "properties": {
+        "gates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["gate", "status", "detail"],
+            "properties": {
+              "gate": { "type": "string" },
+              "status": { "type": "string" },
+              "detail": { "type": "string" },
+              "metrics": { "type": "object" }
+            }
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "limitations": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    "capture_metrics": {
+      "type": "object",
+      "required": ["captured_seconds", "chunk_count"],
+      "properties": {
+        "captured_seconds": { "type": "number" },
+        "chunk_count": { "type": "integer" },
+        "gap_seconds": { "type": "number" },
+        "overlap_seconds": { "type": "number" }
+      }
+    },
+    "analysis_metrics": {
+      "type": "object",
+      "required": ["unique_covered_seconds", "coverage_percent"],
+      "properties": {
+        "unique_covered_seconds": { "type": "number" },
+        "coverage_percent": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "processed_chunks": { "type": "integer" },
+        "pending_chunks": { "type": "integer" }
+      }
+    },
+    "timeline": {
+      "type": "object",
+      "required": ["segment_count", "segments", "timezone"],
+      "properties": {
+        "segment_count": { "type": "integer" },
+        "segments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["start", "end", "duration_seconds", "kind", "tier"],
+            "properties": {
+              "start": { "type": "string" },
+              "end": { "type": "string" },
+              "duration_seconds": { "type": "number" },
+              "kind": { "type": "string" },
+              "tier": { "type": "string" },
+              "event_count": { "type": "integer" },
+              "mean_confidence": { "type": ["number", "null"] }
+            }
+          }
+        },
+        "timezone": { "type": "string" }
+      }
+    },
+    "content_blocks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "duration_seconds", "block_type", "confidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "start": { "type": "string" },
+          "end": { "type": "string" },
+          "duration_seconds": { "type": "number" },
+          "block_type": { "type": "string" },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "confidence_basis": { "type": "string" },
+          "evidence_event_ids": { "type": "array", "items": { "type": "string" } },
+          "chunk_ids": { "type": "array", "items": { "type": "string" } },
+          "source_audio_files": { "type": "array", "items": { "type": "string" } },
+          "notes": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "program_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["bucket", "block_type", "occurrences", "confidence"],
+        "properties": {
+          "bucket": { "type": "string" },
+          "block_type": { "type": "string" },
+          "occurrences": { "type": "integer" },
+          "mean_duration_seconds": { "type": "number" },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "sufficiency_status": { "type": "string" }
+        }
+      }
+    },
+    "clock_patterns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["pattern_type", "description", "occurrences", "confidence"],
+        "properties": {
+          "pattern_type": { "type": "string" },
+          "description": { "type": "string" },
+          "occurrences": { "type": "integer" },
+          "evidence": { "type": "array", "items": { "type": "string" } },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "sufficiency_status": { "type": "string" }
+        }
+      }
+    },
+    "dayparts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["daypart", "window", "monitored_seconds", "confidence"],
+        "properties": {
+          "daypart": { "type": "string" },
+          "window": { "type": "string" },
+          "monitored_seconds": { "type": "number" },
+          "speech_seconds": { "type": ["number", "null"] },
+          "unknown_seconds": { "type": ["number", "null"] },
+          "silence_seconds": { "type": ["number", "null"] },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "sufficiency_status": { "type": "string" },
+          "coverage_ratio": { "type": "number" },
+          "observations": { "type": "array" }
+        }
+      }
+    },
+    "recurrent_elements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["label", "occurrences", "tier"],
+        "properties": {
+          "label": { "type": "string" },
+          "tier": { "type": "string" },
+          "fingerprint_prefix": { "type": "string" },
+          "occurrences": { "type": "integer" },
+          "chunk_starts": { "type": "array", "items": { "type": "string" } }
+        }
+      }
+    },
+    "programming_intelligence": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["classification", "observation", "evidence", "confidence", "confidence_basis"],
+        "properties": {
+          "classification": {
+            "type": "string",
+            "enum": ["OBSERVED", "INFERRED", "NAS_FM_PLANNING_INPUT"]
+          },
+          "type": {
+            "type": "string",
+            "enum": ["OBSERVED", "INFERRED", "NAS_FM_PLANNING_INPUT", "RECOMMENDATION"]
+          },
+          "observation": { "type": "string" },
+          "evidence": { "type": "string" },
+          "occurrences": { "type": "integer" },
+          "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+          "confidence_basis": { "type": "string" },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "limitations": { "type": "array", "items": { "type": "string" } },
+          "nas_fm_planning_input": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "incidents": {
+      "type": "object",
+      "required": ["total", "by_severity", "items"],
+      "properties": {
+        "total": { "type": "integer" },
+        "by_severity": { "type": "object" },
+        "items": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["occurred_at", "kind", "severity"],
+            "properties": {
+              "occurred_at": { "type": "string" },
+              "kind": { "type": "string" },
+              "severity": { "type": "string" },
+              "details": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

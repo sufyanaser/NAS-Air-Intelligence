@@ -1,9 +1,11 @@
 import { useTheme } from "./ThemeProvider";
 import { formatCalmDuration } from "./formatters";
 import type { AgentStatus } from "../agent";
+import type { HealthState } from "../health";
 
 interface TopBarProps {
   status?: AgentStatus | null;
+  healthState?: HealthState;
   onOpenDiagnostics: () => void;
   onOpenUpdates?: () => void;
   updateAvailable?: boolean;
@@ -11,6 +13,7 @@ interface TopBarProps {
 
 export default function TopBar({
   status,
+  healthState,
   onOpenDiagnostics,
   onOpenUpdates,
   updateAvailable = false,
@@ -72,6 +75,51 @@ export default function TopBar({
       </div>
 
       <div className="top-bar-right">
+        {/* Engine Status & System Health */}
+        {healthState?.phase === "starting" && (
+          <div className="topbar-health-pill starting" onClick={onOpenDiagnostics}>
+            <span className="pulse-dot-amber" />
+            <span role="status">Starting analysis engine…</span>
+          </div>
+        )}
+        {healthState?.phase === "ready" && (
+          <button
+            type="button"
+            className="topbar-health-pill ready"
+            onClick={onOpenDiagnostics}
+            title="Analysis Engine Ready — Click for Diagnostics"
+          >
+            <span className="pulse-dot-green" />
+            <span className="health-status-label" role="status">Engine ready</span>
+            <span className="health-meta-compact">
+              <span className="meta-py">{healthState.health.python}</span>
+              <span className="meta-sep">·</span>
+              <span className="meta-ffmpeg">{healthState.health.ffmpeg && healthState.health.ffprobe ? "found" : "not found"}</span>
+            </span>
+          </button>
+        )}
+        {healthState?.phase === "failed" && (
+          <button
+            type="button"
+            className="topbar-health-pill failed"
+            onClick={onOpenDiagnostics}
+          >
+            <span className="pulse-dot-red" />
+            <span role="alert">Engine unavailable</span>
+          </button>
+        )}
+        {!healthState && (
+          <button
+            type="button"
+            className="btn-topbar-action"
+            onClick={onOpenDiagnostics}
+            title="System Health & Diagnostics"
+          >
+            <span className="pulse-dot-green" />
+            <span>Health</span>
+          </button>
+        )}
+
         {onOpenUpdates && (
           <button
             type="button"
@@ -79,20 +127,10 @@ export default function TopBar({
             onClick={onOpenUpdates}
             title="Software Updates"
           >
-            <span>Update</span>
+            <span>Updates</span>
             {updateAvailable && <span className="status-dot-amber" />}
           </button>
         )}
-
-        <button
-          type="button"
-          className="btn-topbar-action"
-          onClick={onOpenDiagnostics}
-          title="System Health & Diagnostics"
-        >
-          <span className="pulse-dot-green" />
-          <span>Health</span>
-        </button>
 
         <button
           type="button"

@@ -1,3 +1,4 @@
+import { formatCalmDuration } from "./formatters";
 import type { AgentStatus } from "../agent";
 
 interface MonitoringControlsProps {
@@ -11,6 +12,7 @@ interface MonitoringControlsProps {
 
 export default function MonitoringControls({
   onStart,
+  onStop,
   starting,
   formError,
   status,
@@ -19,17 +21,42 @@ export default function MonitoringControls({
   const showStartForm = !status || isTerminal;
 
   if (!showStartForm) {
+    const elapsed = status.elapsed_seconds ?? 0;
+    const requested = status.requested_seconds ?? 600;
+    const progressPercent = requested > 0 ? Math.min(100, Math.max(0, Math.round((elapsed / requested) * 100))) : 0;
+
     return (
       <section className="control-strip collapsed" aria-label="Active session summary">
-        <div className="control-strip-summary">
+        <div className="active-strip-left">
           <div className="status-indicator">
             <span className="live-pulse" />
-            <span className="status-label">MONITORING</span>
+            <span className="status-label">LIVE MONITORING</span>
           </div>
-          <span className="mode-pill">{status.mode} mode</span>
-          <span className="time-pill">
-            {status.requested_seconds ? `${Math.round(status.requested_seconds / 60)}m target` : ""}
-          </span>
+          <span className="active-station-badge">Station: {status.station}</span>
+          <span className="mode-pill">{status.mode}</span>
+          <span className="analyzer-pill">{status.requested_seconds ? `${Math.round(status.requested_seconds / 60)}m target` : ""}</span>
+        </div>
+
+        <div className="active-strip-center">
+          <div className="calm-timer-inline">
+            <span className="calm-timer-text">
+              {formatCalmDuration(elapsed)} / {formatCalmDuration(requested)}
+            </span>
+            <div className="calm-progress-bar-sm" role="progressbar" aria-valuenow={progressPercent} aria-valuemin={0} aria-valuemax={100}>
+              <div className="calm-progress-fill" style={{ width: `${progressPercent}%` }} />
+            </div>
+          </div>
+        </div>
+
+        <div className="active-strip-right">
+          <button
+            type="button"
+            className="btn btn-sm btn-outline-danger"
+            onClick={onStop}
+            title="Stop current monitoring session"
+          >
+            Stop
+          </button>
         </div>
       </section>
     );
@@ -47,7 +74,7 @@ export default function MonitoringControls({
         <div className="form-group flex-1">
           <input
             name="station"
-            placeholder="Station name"
+            placeholder="Station name (e.g. Al Nakhla FM)"
             aria-label="Station name"
             className="input-field"
           />
@@ -55,7 +82,7 @@ export default function MonitoringControls({
         <div className="form-group flex-2">
           <input
             name="source"
-            placeholder="Station page or stream URL"
+            placeholder="Station page or stream URL (e.g. https://www.al-nakhla.net/ar/radio)"
             aria-label="Station page or stream URL"
             className="input-field"
           />

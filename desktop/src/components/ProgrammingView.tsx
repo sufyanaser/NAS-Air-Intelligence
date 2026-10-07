@@ -158,13 +158,13 @@ export default function ProgrammingView({ programming, onRefresh }: ProgrammingV
                 <div className="candidate-list">
                   {candidates.map((cand, i) => (
                     <div key={i} className="candidate-item">
-                      <span className="cand-title">{String(cand.title || "Program Block Candidate")}</span>
+                      <span className="cand-title">{String(cand.bucket)} ({String(cand.block_type)})</span>
                       <span className="cand-meta">
-                        {Math.round(Number(cand.duration_seconds || 0) / 60)} min • {(Number(cand.confidence || 0) * 100).toFixed(0)}% conf
+                        {Math.round(Number(cand.mean_duration_seconds || 0) / 60)} min • {(Number(cand.confidence || 0) * 100).toFixed(0)}% conf • {String(cand.occurrences)} occ
                       </span>
                     </div>
                   ))}
-                  {candidates.length === 0 && <p className="empty-text">No program candidates identified yet.</p>}
+                  {candidates.length === 0 && <p className="empty-text">No program candidates identified (insufficient sample or analysis blocked).</p>}
                 </div>
               </div>
 
@@ -181,7 +181,7 @@ export default function ProgrammingView({ programming, onRefresh }: ProgrammingV
                       <span className="pat-meta">{String(pat.occurrences)} occurrences</span>
                     </div>
                   ))}
-                  {clockPatterns.length === 0 && <p className="empty-text">No recurrent clock patterns detected.</p>}
+                  {clockPatterns.length === 0 && <p className="empty-text">No recurrent clock patterns detected (insufficient sample or analysis blocked).</p>}
                 </div>
               </div>
             </div>
@@ -194,25 +194,30 @@ export default function ProgrammingView({ programming, onRefresh }: ProgrammingV
               {dayparts.map((dp, i) => (
                 <div key={i} className="daypart-card">
                   <div className="daypart-header">
-                    <h4>{String(dp.daypart_name).toUpperCase()}</h4>
-                    <span className="daypart-hours">
-                      {String(dp.start_hour).padStart(2, "0")}:00 – {String(dp.end_hour).padStart(2, "0")}:00
-                    </span>
+                    <h4>{String(dp.daypart || "").toUpperCase()}</h4>
+                    <span className="daypart-hours">{String(dp.window || "")}</span>
                   </div>
                   <div className="daypart-metrics">
                     <div className="dp-metric">
-                      <span className="dp-label">Speech Ratio</span>
-                      <span className="dp-val">{(Number(dp.speech_pct || 0)).toFixed(1)}%</span>
+                      <span className="dp-label">Speech</span>
+                      <span className="dp-val">{dp.speech_seconds != null ? `${Number(dp.speech_seconds).toFixed(0)}s` : "UNAVAILABLE"}</span>
                     </div>
                     <div className="dp-metric">
-                      <span className="dp-label">Music / Non-Speech</span>
-                      <span className="dp-val">{(Number(dp.music_pct || 0)).toFixed(1)}%</span>
+                      <span className="dp-label">Unclassified</span>
+                      <span className="dp-val">{dp.unknown_seconds != null ? `${Number(dp.unknown_seconds).toFixed(0)}s` : "UNAVAILABLE"}</span>
                     </div>
                     <div className="dp-metric">
-                      <span className="dp-label">Total Blocks</span>
-                      <span className="dp-val">{String(dp.block_count || 0)}</span>
+                      <span className="dp-label">Sample Status</span>
+                      <span className="dp-val">{String(dp.sufficiency_status || "INSUFFICIENT_SAMPLE")}</span>
                     </div>
                   </div>
+                  {Array.isArray(dp.observations) && dp.observations.length > 0 && (
+                    <div className="dp-observations">
+                      {dp.observations.map((obs: Record<string, unknown>, oi: number) => (
+                        <p key={oi} className="dp-obs-text">{String(obs.text || "")}</p>
+                      ))}
+                    </div>
+                  )}
                 </div>
               ))}
               {dayparts.length === 0 && <p className="empty-text">No dayparts covered in this session.</p>}
@@ -227,7 +232,7 @@ export default function ProgrammingView({ programming, onRefresh }: ProgrammingV
                 <div key={i} className="content-block-card">
                   <div className="block-header">
                     <span className="badge-observed">OBSERVED</span>
-                    <span className="block-kind">{String(blk.kind).toUpperCase()}</span>
+                    <span className="block-kind">{String(blk.block_type || blk.kind || "UNKNOWN").toUpperCase()}</span>
                     <span className="block-dur">{Math.round(Number(blk.duration_seconds || 0))}s</span>
                   </div>
                   <div className="block-times">
@@ -238,7 +243,7 @@ export default function ProgrammingView({ programming, onRefresh }: ProgrammingV
                   </div>
                 </div>
               ))}
-              {contentBlocks.length === 0 && <p className="empty-text">No content blocks segmented yet.</p>}
+              {contentBlocks.length === 0 && <p className="empty-text">No content blocks segmented yet (analysis blocked or unavailable).</p>}
             </div>
           </div>
         )}

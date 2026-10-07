@@ -282,8 +282,13 @@ def test_build_programming_analysis_matches_study_summary_shape(tmp_path):
     result = build_programming_analysis(db, session_id)
     summary = result["study_summary"]
     assert set(summary) == {
-        "duration_seconds", "timeline_coverage_pct", "content_block_count",
-        "program_candidate_count", "clock_pattern_count", "dayparts_covered", "incidents",
+        "duration_seconds",
+        "timeline_coverage_pct",
+        "content_block_count",
+        "program_candidate_count",
+        "clock_pattern_count",
+        "dayparts_covered",
+        "incidents",
     }
     assert summary["timeline_coverage_pct"] == pytest.approx(100.0, abs=0.5)
     assert summary["content_block_count"] >= 1

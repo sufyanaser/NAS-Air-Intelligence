@@ -385,12 +385,13 @@ class MonitoringAgent:
             self._state(AgentState.PROCESSING)
         self._state(AgentState.FINALIZING)
         self._state(AgentState.REPORTING)
+        degraded = self._degraded_to_baseline()
+        expects_tx = run["analyzer"] != "baseline"
         report, json_path, md_path, problems = write_agent_report(
             self.db, session_id, self.storage_dir / "reports",
             requested_seconds=float(run["duration_seconds"]), run=self.store.get(self.run_id),
-            expects_transcription=(
-                run["analyzer"] != "baseline" and not self._degraded_to_baseline()
-            ),
+            expects_transcription=expects_tx,
+            is_dependency_unavailable=degraded,
         )  # fmt: skip
         for problem in problems:
             self._warn(f"report review: {problem}")
@@ -417,6 +418,8 @@ class MonitoringAgent:
                 "gates": {g["gate"]: g["status"] for g in report["capture_health"]["gates"]},
                 "executive_summary": report["executive_summary"],
                 "review_problems": problems,
+                "validity": report.get("validity"),
+                "decision_readiness": report.get("decision_readiness"),
             },
         )
         self._log(
