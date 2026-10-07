@@ -14,6 +14,7 @@ from ..util import parse_duration, parse_iso, utc_now
 from .quality import incident_severity
 from .states import AgentState
 from .store import AgentStore
+from .timeline import build_timeline, current_material, format_timeline, station_timezone
 
 MODES = {"smoke": "10m", "validation": "2h"}
 _WINDOWS_FLAGS = {
@@ -51,10 +52,19 @@ def spawn_worker(
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out = (log_dir / f"agent-{run_id[:8]}-{stamp}.out.log").open("ab")
     err = (log_dir / f"agent-{run_id[:8]}-{stamp}.err.log").open("ab")
-    command = [
-        sys.executable, "-m", "nas_air_intelligence.cli", "--db", db_path,
-        "agent", "_run", run_id, "--storage", storage,
-    ]  # fmt: skip
+    if getattr(sys, "frozen", False):
+        # A frozen sidecar *is* the interpreter: there is no separate python.exe to run
+        # "-m nas_air_intelligence.cli" against. The frozen entry point (desktop/sidecar/
+        # entry.py) dispatches "cli" as its first argument to the regular CLI parser and
+        # everything else to its own sidecar flags, so that sentinel is required here.
+        command = [
+            sys.executable, "cli", "--db", db_path, "agent", "_run", run_id, "--storage", storage,
+        ]  # fmt: skip
+    else:
+        command = [
+            sys.executable, "-m", "nas_air_intelligence.cli", "--db", db_path,
+            "agent", "_run", run_id, "--storage", storage,
+        ]  # fmt: skip
     if recover:
         command.append("--recover")
     command += extra or []
@@ -79,6 +89,41 @@ def spawn_worker(
     return process.pid
 
 
+def create_and_launch_run(
+    store: AgentStore,
+    *,
+    db_path: str,
+    storage: str,
+    log_dir: Path,
+    station: str | None,
+    page: str | None,
+    url: str | None,
+    mode: str | None,
+    duration: str | None,
+    segment_seconds: int,
+    analyzer: str,
+    model: str | None,
+) -> dict[str, Any]:
+    """Validate, persist, and launch one agent run. Shared by the CLI and the desktop sidecar."""
+    if not station:
+        raise ValueError("a station name is required")
+    if not page and not url:
+        raise ValueError("provide a station page or a stream url")
+    if segment_seconds < 10:
+        raise ValueError("segment_seconds must be at least 10")
+    resolved_mode, seconds = resolve_duration(mode, duration)
+    run_id = store.create(
+        station_name=station, source_page=page, requested_url=url, mode=resolved_mode,
+        duration_seconds=seconds, segment_seconds=segment_seconds, analyzer=analyzer, model=model,
+    )  # fmt: skip
+    pid = spawn_worker(run_id, db_path=db_path, storage=storage, log_dir=log_dir)
+    store.update(run_id, pid=pid)
+    return {
+        "run_id": run_id, "station": station, "mode": resolved_mode,
+        "duration_seconds": seconds, "worker_pid": pid,
+    }  # fmt: skip
+
+
 def live_metrics(db: Database, session_id: str | None) -> dict[str, Any]:
     if not session_id:
         return {}
@@ -93,13 +138,51 @@ def live_metrics(db: Database, session_id: str | None) -> dict[str, Any]:
     for item in incidents:
         sev = incident_severity(item)
         severities[sev] = severities.get(sev, 0) + 1
+    pending = sum(1 for c in chunks if not c["analyzed"])
     return {
         "session_status": session["status"],
         "elapsed_seconds": round((end - started).total_seconds()),
         "chunks": len(chunks),
         "captured_seconds": round(sum(float(c["duration_seconds"]) for c in chunks)),
-        "pending_chunks": sum(1 for c in chunks if not c["analyzed"]),
+        "processed_chunks": len(chunks) - pending,
+        "pending_chunks": pending,
         "incidents": severities,
+    }
+
+
+def resolve_session_for_study(
+    store: AgentStore, db: Database, ident: str
+) -> tuple[str, float, dict[str, Any] | None]:
+    """An agent-run id/prefix, or a bare session id: either way resolve to
+    (session_id, requested_seconds, run-or-None). Shared by the CLI's and the sidecar's
+    ``programming``/``export`` surfaces, which study data by session regardless of whether
+    it was captured through the agent or the plain ``monitor`` command."""
+    run = store.find(ident)
+    if run:
+        if not run.get("session_id"):
+            raise KeyError(f"agent run {ident} has no session yet (it has not started capturing)")
+        return run["session_id"], float(run["duration_seconds"]), run
+    session = db.session(ident)
+    if not session:
+        raise KeyError(f"unknown agent run or session: {ident}")
+    return ident, float(session["target_seconds"]), None
+
+
+def live_timeline(db: Database, session_id: str | None) -> dict[str, Any]:
+    """Timeline segments plus "Current Material" for an in-progress or finished session."""
+    if not session_id:
+        return {"segments": [], "rendered": [], "current_material": None}
+    session = db.session(session_id)
+    if not session:
+        return {"segments": [], "rendered": [], "current_material": None}
+    chunks = db.chunks(session_id)
+    events = db.events(session_id)
+    tz = station_timezone(session.get("timezone"))
+    segments = build_timeline(chunks, events)
+    return {
+        "segments": [s.to_dict() for s in segments],
+        "rendered": format_timeline(segments, tz),
+        "current_material": current_material(chunks, events),
     }
 
 

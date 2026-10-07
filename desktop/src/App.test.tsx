@@ -2,6 +2,12 @@ import { render, screen } from "@testing-library/react";
 import App from "./App";
 import { waitForSidecar, type SidecarHealth } from "./health";
 
+// AgentPanel's own behavior (start/status/journal/websocket bridging) is covered by
+// AgentPanel.test.tsx. App's tests only own the sidecar health-check flow, so the real
+// AgentPanel - which calls the Tauri event/invoke bridge that does not exist under jsdom -
+// is replaced with an inert stub here.
+vi.mock("./AgentPanel", () => ({ default: () => <div data-testid="agent-panel-stub" /> }));
+
 const ready: SidecarHealth = {
   status: "ready",
   service: "nas-air-sidecar",

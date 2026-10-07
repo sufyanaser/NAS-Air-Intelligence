@@ -10,14 +10,17 @@ from pathlib import Path
 from typing import Any
 
 from ..db import Database
+from .excel_export import write_workbook
 from .launcher import (
+    create_and_launch_run,
     describe,
     live_metrics,
+    live_timeline,
     request_stop,
-    resolve_duration,
-    spawn_worker,
+    resolve_session_for_study,
 )
 from .orchestrator import MonitoringAgent
+from .programming import build_programming_analysis
 from .report import build_agent_report
 from .store import AgentStore
 
@@ -35,45 +38,29 @@ def _print(payload: Any) -> None:
 
 
 def _find_run(store: AgentStore, ident: str) -> dict[str, Any] | None:
-    run = store.get(ident) or store.by_session(ident)
-    if run:
-        return run
-    matches = [r for r in store.all() if r["id"].startswith(ident)]
-    return matches[0] if len(matches) == 1 else None
+    return store.find(ident)
+
+
+def _resolve_session(
+    db: Database, store: AgentStore, ident: str
+) -> tuple[str, float, dict[str, Any] | None]:
+    return resolve_session_for_study(store, db, ident)
 
 
 def command_start(args: argparse.Namespace) -> int:
     name = args.station or args.name
     if not name:
         raise ValueError("--station (or --name) is required")
-    if not (args.page or args.url):
-        raise ValueError("provide --page <station page> or --url <stream url>")
-    mode, seconds = resolve_duration(args.mode, args.duration)
-    if args.segment_seconds < 10:
-        raise ValueError("segment_seconds must be at least 10")
     db = Database(_db_path(args))
     store = AgentStore(db)
-    run_id = store.create(
-        station_name=name, source_page=args.page, requested_url=args.url, mode=mode,
-        duration_seconds=seconds, segment_seconds=args.segment_seconds,
+    storage = _storage(args)
+    result = create_and_launch_run(
+        store, db_path=str(Path(_db_path(args)).resolve()), storage=str(Path(storage).resolve()),
+        log_dir=Path(storage) / "logs", station=name, page=args.page, url=args.url,
+        mode=args.mode, duration=args.duration, segment_seconds=args.segment_seconds,
         analyzer=args.analyzer, model=args.model,
     )  # fmt: skip
-    storage = _storage(args)
-    pid = spawn_worker(
-        run_id, db_path=str(Path(_db_path(args)).resolve()), storage=str(Path(storage).resolve()),
-        log_dir=Path(storage) / "logs",
-    )  # fmt: skip
-    store.update(run_id, pid=pid)
-    _print(
-        {
-            "run_id": run_id,
-            "station": name,
-            "mode": mode,
-            "duration_seconds": seconds,
-            "worker_pid": pid,
-            "next": f"nas-air agent status {run_id[:8]}",
-        }  # fmt: skip
-    )
+    _print({**result, "next": f"nas-air agent status {result['run_id'][:8]}"})
     return 0
 
 
@@ -146,6 +133,50 @@ def command_result(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_timeline(args: argparse.Namespace) -> int:
+    db = Database(_db_path(args))
+    store = AgentStore(db)
+    run = _find_run(store, args.run)
+    session_id = run["session_id"] if run else args.run
+    if run is None and not db.session(session_id):
+        raise KeyError(f"unknown agent run or session: {args.run}")
+    _print({"run_id": run["id"] if run else None, "session_id": session_id,
+            **live_timeline(db, session_id)})  # fmt: skip
+    return 0
+
+
+def command_journal(args: argparse.Namespace) -> int:
+    db = Database(_db_path(args))
+    store = AgentStore(db)
+    run = _find_run(store, args.run)
+    if not run:
+        raise KeyError(f"unknown agent run: {args.run}")
+    _print({"run_id": run["id"], "events": store.events(run["id"])})
+    return 0
+
+
+def command_programming(args: argparse.Namespace) -> int:
+    db = Database(_db_path(args))
+    store = AgentStore(db)
+    session_id, _requested, run = _resolve_session(db, store, args.run)
+    result = build_programming_analysis(db, session_id)
+    _print({"run_id": run["id"] if run else None, **result})
+    return 0
+
+
+def command_export(args: argparse.Namespace) -> int:
+    db = Database(_db_path(args))
+    store = AgentStore(db)
+    session_id, requested_seconds, run = _resolve_session(db, store, args.run)
+    storage = _storage(args)
+    path = write_workbook(
+        db, session_id, Path(storage) / "exports",
+        requested_seconds=requested_seconds, run=run,
+    )  # fmt: skip
+    _print({"run_id": run["id"] if run else None, "session_id": session_id, "xlsx": str(path)})
+    return 0
+
+
 def command_worker(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     db = Database(_db_path(args))
@@ -190,6 +221,26 @@ def register(sub: Any) -> None:
     result = asub.add_parser("result", help="final outcome, gates, and report paths")
     result.add_argument("run", help="agent run id or any monitor session id")
     result.set_defaults(func=command_result)
+
+    timeline = asub.add_parser("timeline", help="live or final timeline and current material")
+    timeline.add_argument("run", help="agent run id or any monitor session id")
+    timeline.set_defaults(func=command_timeline)
+
+    journal = asub.add_parser("journal", help="Agent Run Journal (activity feed events)")
+    journal.add_argument("run", help="agent run id")
+    journal.set_defaults(func=command_journal)
+
+    programming = asub.add_parser(
+        "programming", help="Programming Intelligence: content blocks, candidates, "
+        "clock patterns, dayparts, insights"
+    )  # fmt: skip
+    programming.add_argument("run", help="agent run id or any monitor session id")
+    programming.set_defaults(func=command_programming)
+
+    export = asub.add_parser("export", help="write the 8-sheet Excel study workbook")
+    export.add_argument("run", help="agent run id or any monitor session id")
+    export.add_argument("--storage")
+    export.set_defaults(func=command_export)
 
     worker = asub.add_parser("_run")
     worker.add_argument("run_id")
