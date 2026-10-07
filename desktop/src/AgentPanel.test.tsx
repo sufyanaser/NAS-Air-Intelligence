@@ -65,8 +65,16 @@ function makeApi(overrides: Partial<Record<string, unknown>> = {}) {
     result: vi.fn().mockResolvedValue(completedStatus),
     timeline: vi.fn().mockResolvedValue(emptyTimeline),
     journal: vi.fn().mockResolvedValue(emptyJournal),
+    programming: vi.fn().mockResolvedValue({ study_summary: { content_block_count: 1 } }),
+    exportExcel: vi.fn().mockResolvedValue({
+      run_id: RUN_ID, status: "started", export_dir: "C:\\exports",
+    }),
     watch: vi.fn().mockResolvedValue(undefined),
     onEvent: vi.fn().mockResolvedValue(() => {}),
+    setActive: vi.fn().mockResolvedValue(undefined),
+    onConfirmExit: vi.fn().mockResolvedValue(() => {}),
+    confirmKeep: vi.fn().mockResolvedValue(undefined),
+    confirmStopAndQuit: vi.fn().mockResolvedValue(undefined),
     ...overrides,
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   } as any;
@@ -124,6 +132,16 @@ describe("AgentPanel resume / reconnect", () => {
     expect(await screen.findByText("Al Nakhla FM")).toBeInTheDocument();
     expect(api.status).toHaveBeenCalledWith(RUN_ID);
     expect(api.watch).toHaveBeenCalledWith(RUN_ID);
+  });
+
+  it("falls back to the Start form when a persisted run id no longer resolves", async () => {
+    // e.g. the backend's database was reset, or an old install's localStorage survived a
+    // reinstall: resuming that id can never succeed, and must not blank the screen forever.
+    window.localStorage.setItem("nas-air:lastRunId", RUN_ID);
+    const api = makeApi({ status: vi.fn().mockRejectedValue(new Error("unknown agent run")) });
+    render(<AgentPanel api={api} pollMs={100_000} />);
+    expect(await screen.findByLabelText("Station name")).toBeInTheDocument();
+    expect(window.localStorage.getItem("nas-air:lastRunId")).toBeNull();
   });
 
   it("keeps polling on its own interval regardless of WebSocket events", async () => {
@@ -208,5 +226,105 @@ describe("AgentPanel live + result views", () => {
     expect(screen.getByText("capture: pass")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /stop monitoring/i })).not.toBeInTheDocument();
     expect(screen.getByLabelText("Station name")).toBeInTheDocument(); // can start a new run
+  });
+});
+
+describe("AgentPanel hardening: active-run tracking, quit dialog, self-heal", () => {
+  it("tells Rust whenever the active run changes, and clears it once terminal", async () => {
+    window.localStorage.setItem("nas-air:lastRunId", RUN_ID);
+    const api = makeApi({ status: vi.fn().mockResolvedValue(capturingStatus) });
+    render(<AgentPanel api={api} pollMs={100_000} />);
+    await waitFor(() => expect(api.setActive).toHaveBeenCalledWith(RUN_ID));
+
+    api.status.mockResolvedValue(completedStatus);
+    fireEvent.click(await screen.findByRole("button", { name: /stop monitoring/i }));
+    await waitFor(() => expect(api.setActive).toHaveBeenLastCalledWith(null));
+  });
+
+  it("shows the keep/stop/cancel dialog on confirm-exit and acts on the chosen option", async () => {
+    let deliver: (e: { run_id: string }) => void = () => {};
+    const api = makeApi({
+      status: vi.fn().mockResolvedValue(capturingStatus),
+      onConfirmExit: vi.fn().mockImplementation((handler) => {
+        deliver = handler;
+        return Promise.resolve(() => {});
+      }),
+    });
+    window.localStorage.setItem("nas-air:lastRunId", RUN_ID);
+    render(<AgentPanel api={api} pollMs={100_000} />);
+    await waitFor(() => expect(api.onConfirmExit).toHaveBeenCalled());
+
+    deliver({ run_id: RUN_ID });
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /stop monitoring and quit/i }));
+    await waitFor(() => expect(api.confirmStopAndQuit).toHaveBeenCalledWith(RUN_ID));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("cancel just closes the dialog without calling either exit path", async () => {
+    let deliver: (e: { run_id: string }) => void = () => {};
+    const api = makeApi({
+      status: vi.fn().mockResolvedValue(capturingStatus),
+      onConfirmExit: vi.fn().mockImplementation((handler) => {
+        deliver = handler;
+        return Promise.resolve(() => {});
+      }),
+    });
+    window.localStorage.setItem("nas-air:lastRunId", RUN_ID);
+    render(<AgentPanel api={api} pollMs={100_000} />);
+    await waitFor(() => expect(api.onConfirmExit).toHaveBeenCalled());
+    deliver({ run_id: RUN_ID });
+    fireEvent.click(await screen.findByRole("button", { name: /^cancel$/i }));
+    expect(api.confirmKeep).not.toHaveBeenCalled();
+    expect(api.confirmStopAndQuit).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("self-heals once when the worker stops reporting (attention), then stops retrying", async () => {
+    const stuck: AgentStatus = { ...capturingStatus, attention: "worker is not reporting" };
+    const api = makeApi({ status: vi.fn().mockResolvedValue(stuck) });
+    window.localStorage.setItem("nas-air:lastRunId", RUN_ID);
+    render(<AgentPanel api={api} pollMs={20} />);
+    await waitFor(() => expect(api.stop).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(api.status.mock.calls.length).toBeGreaterThan(3));
+    expect(api.stop).toHaveBeenCalledTimes(1); // not re-triggered on every subsequent poll
+  });
+});
+
+describe("AgentPanel Study Tools", () => {
+  it("fetches and displays the Programming Intelligence study summary", async () => {
+    window.localStorage.setItem("nas-air:lastRunId", RUN_ID);
+    const api = makeApi({ status: vi.fn().mockResolvedValue(completedStatus) });
+    render(<AgentPanel api={api} pollMs={100_000} />);
+    fireEvent.click(await screen.findByRole("button", { name: /view programming intelligence/i }));
+    await waitFor(() => expect(api.programming).toHaveBeenCalledWith(RUN_ID));
+    expect(await screen.findByText("content block count")).toBeInTheDocument();
+  });
+
+  it("starts an export and shows the background-started acknowledgement", async () => {
+    window.localStorage.setItem("nas-air:lastRunId", RUN_ID);
+    const api = makeApi({ status: vi.fn().mockResolvedValue(completedStatus) });
+    render(<AgentPanel api={api} pollMs={100_000} />);
+    fireEvent.click(await screen.findByRole("button", { name: /export excel/i }));
+    await waitFor(() => expect(api.exportExcel).toHaveBeenCalledWith(RUN_ID));
+    expect(await screen.findByText(/export started/i)).toBeInTheDocument();
+  });
+
+  it("shows the EXPORT_CREATED journal entry as the completion signal once it appears", async () => {
+    window.localStorage.setItem("nas-air:lastRunId", RUN_ID);
+    const api = makeApi({
+      status: vi.fn().mockResolvedValue(completedStatus),
+      journal: vi.fn().mockResolvedValue({
+        run_id: RUN_ID,
+        events: [
+          { id: "1", run_id: RUN_ID, session_id: "s", occurred_at: "t", stage: "COMPLETED",
+            event_type: "EXPORT_CREATED", status: "ok", message: "C:\\exports\\out.xlsx",
+            details: {}, severity: "info" },
+        ],
+      }),
+    });
+    render(<AgentPanel api={api} pollMs={100_000} />);
+    expect(await screen.findByText(/Export complete/i)).toBeInTheDocument();
   });
 });

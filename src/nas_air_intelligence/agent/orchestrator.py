@@ -8,6 +8,7 @@ the capture thread indexes completed chunks, the analyzer thread consumes chunks
 from __future__ import annotations
 
 import logging
+import shutil
 import threading
 import time
 import traceback
@@ -28,6 +29,7 @@ logger = logging.getLogger(__name__)
 HEARTBEAT_INTERVAL = 5.0
 DRAIN_TIMEOUT_SECONDS = 1800.0
 DEGRADED_AFTER_FAILURES = 3
+LOW_DISK_THRESHOLD_BYTES = 500 * 1024 * 1024  # 500 MiB: below this, a long run can fail capture
 _FAILURE_KINDS = ("analysis_failure", "transcription_incident")
 
 AnalyzerFactory = Callable[[str, str | None, str], Analyzer]
@@ -78,6 +80,7 @@ class MonitoringAgent:
         self._session_id: str | None = None
         self._capture_error: str | None = None
         self._degraded = False
+        self._low_disk_warned = False
 
     # ------------------------------------------------------------------ helpers
     def _default_monitor(self, analyzer: Analyzer | None = None) -> StreamMonitor:
@@ -266,6 +269,24 @@ class MonitoringAgent:
     def _failure_count(self, session_id: str) -> int:
         return sum(1 for i in self.db.incidents(session_id) if i["kind"] in _FAILURE_KINDS)
 
+    def _check_low_disk(self) -> None:
+        try:
+            free = shutil.disk_usage(self.storage_dir).free
+        except OSError:
+            return  # best effort; a transient stat failure must not interrupt capture
+        if free < LOW_DISK_THRESHOLD_BYTES:
+            if not self._low_disk_warned:
+                self._low_disk_warned = True
+                message = f"free disk space is low: {free / (1024 * 1024):.0f} MiB remaining"
+                self._warn(message)
+                self._log(
+                    AgentState.CAPTURING, "LOW_DISK_WARNING",
+                    status="warn", severity="warn", message=message,
+                    details={"free_bytes": free},
+                )  # fmt: skip
+        else:
+            self._low_disk_warned = False  # recovered; a renewed drop warns again
+
     def _supervise(self, capture: threading.Thread) -> None:
         last_chunks, last_progress = 0, time.monotonic()
         last_reconnects = 0
@@ -274,6 +295,7 @@ class MonitoringAgent:
         stall_after = 3 * float(run.get("segment_seconds", 300)) + 90
         while capture.is_alive():
             capture.join(self.poll_seconds)
+            self._check_low_disk()
             if self.store.stop_requested(self.run_id) and not self.stop_event.is_set():
                 self.stop_event.set()
                 self._warn("stopped early on operator request")

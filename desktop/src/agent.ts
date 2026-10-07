@@ -144,12 +144,37 @@ export const fetchAgentTimeline = (runId: string): Promise<TimelineResponse> =>
 export const fetchAgentJournal = (runId: string): Promise<JournalResponse> =>
   invoke<JournalResponse>("agent_journal", { runId });
 
+export const fetchAgentProgramming = (runId: string): Promise<Record<string, unknown>> =>
+  invoke<Record<string, unknown>>("agent_programming", { runId });
+
+export interface ExportAck {
+  run_id: string;
+  status: "started";
+  export_dir: string;
+}
+
+/** Kicks off the Excel export in a background thread on the sidecar side; completion shows up
+ * as an EXPORT_CREATED/EXPORT_FAILED entry in the journal, not in this response. */
+export const exportAgentExcel = (runId: string): Promise<ExportAck> =>
+  invoke<ExportAck>("agent_export", { runId });
+
 /** Starts (or re-points) the Rust-side WebSocket watcher for one run. Never required for
  * correctness - it only shortens the wait before the next poll picks up a change. */
 export const watchAgent = (runId: string): Promise<void> => invoke<void>("agent_watch", { runId });
 
+/** Tells Rust whether this run is "active" for the purposes of the window-close confirmation.
+ * Pass null when there is no active run (terminal, or none started). */
+export const setMonitoringActive = (runId: string | null): Promise<void> =>
+  invoke<void>("set_monitoring_active", { runId });
+
+export const confirmExitKeepMonitoring = (): Promise<void> =>
+  invoke<void>("confirm_exit_keep_monitoring");
+
+export const confirmExitStopAndQuit = (runId: string): Promise<void> =>
+  invoke<void>("confirm_exit_stop_and_quit", { runId });
+
 export interface AgentChangedEvent {
-  event: "changed" | "watch_error";
+  event: "changed" | "watch_error" | "watch_retry" | "sidecar_restarting" | "sidecar_restarted";
   run_id?: string;
   state?: string;
   error?: string;
@@ -158,4 +183,14 @@ export interface AgentChangedEvent {
 /** Subscribes to the Rust-forwarded notification stream. Returns the unsubscribe function. */
 export function onAgentEvent(handler: (event: AgentChangedEvent) => void): Promise<UnlistenFn> {
   return listen<AgentChangedEvent>("agent-event", (e) => handler(e.payload));
+}
+
+export interface ConfirmExitEvent {
+  run_id: string;
+}
+
+/** The window-close handler asks the frontend to resolve "keep monitoring / stop and quit /
+ * cancel" instead of deciding on Rust's own, so the operator sees the app's normal dialog UI. */
+export function onConfirmExit(handler: (event: ConfirmExitEvent) => void): Promise<UnlistenFn> {
+  return listen<ConfirmExitEvent>("confirm-exit", (e) => handler(e.payload));
 }

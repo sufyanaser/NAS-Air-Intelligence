@@ -338,6 +338,45 @@ def test_full_lifecycle_writes_a_run_journal(tmp_path: Path):
     assert all(e["details"] == {} or isinstance(e["details"], dict) for e in journal)
 
 
+def test_low_disk_space_is_warned_once_and_rearms_after_recovery(tmp_path: Path, monkeypatch):
+    from nas_air_intelligence.agent import orchestrator
+
+    db, store, run_id = _setup(tmp_path)
+    agent = _agent(db, store, run_id, tmp_path, FakeMonitor(db, chunks=4))
+
+    import shutil as real_shutil
+
+    calls = {"n": 0}
+    low = real_shutil._ntuple_diskusage(100, 50, 100 * 1024 * 1024)  # 100 MiB free: below the
+    # 500 MiB threshold on the first couple of checks, then recovers for the rest of the run.
+    high = real_shutil._ntuple_diskusage(100, 50, 50 * 1024 * 1024 * 1024)
+
+    def fake_disk_usage(_path):
+        calls["n"] += 1
+        return low if calls["n"] <= 2 else high
+
+    monkeypatch.setattr(orchestrator.shutil, "disk_usage", fake_disk_usage)
+    assert agent.run(pid=1) == AgentState.COMPLETED_WITH_WARNINGS
+
+    journal = store.events(run_id)
+    low_disk = [e for e in journal if e["event_type"] == "LOW_DISK_WARNING"]
+    assert len(low_disk) == 1  # warned once, not on every poll while still low
+    assert low_disk[0]["severity"] == "warn"
+    assert any("low" in w.lower() for w in store.get(run_id)["warnings"])
+
+
+def test_low_disk_check_failure_does_not_interrupt_capture(tmp_path: Path, monkeypatch):
+    from nas_air_intelligence.agent import orchestrator
+
+    db, store, run_id = _setup(tmp_path)
+    agent = _agent(db, store, run_id, tmp_path, FakeMonitor(db, chunks=2))
+    monkeypatch.setattr(
+        orchestrator.shutil, "disk_usage", lambda _p: (_ for _ in ()).throw(OSError("no stat"))
+    )
+    assert agent.run(pid=1) == AgentState.COMPLETED
+    assert not [e for e in store.events(run_id) if e["event_type"] == "LOW_DISK_WARNING"]
+
+
 def test_run_journal_flags_a_degraded_analyzer_and_a_failed_stream(tmp_path: Path):
     db, store, run_id = _setup(tmp_path)
     agent = _agent(

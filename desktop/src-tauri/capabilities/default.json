@@ -3,5 +3,5 @@
   "identifier": "default",
   "description": "Minimal capability: the main window may invoke our own commands only.",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": ["core:default", "updater:default", "process:allow-restart"]
 }
