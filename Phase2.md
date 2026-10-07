@@ -870,7 +870,8 @@ Requirements:
 - data outside install dir;
 - upgrade preserves data;
 - unique versioned installer;
-- no overwritten release artifact.
+- no overwritten release artifact;
+- Auto Update implemented, signed, and real-tested (see section 33).
 
 FFmpeg distribution strategy must be deliberately chosen before final packaging.
 
@@ -1064,3 +1065,62 @@ It is:
 > Can NAS Air monitor a station with minimal operator effort, turn the broadcast into reliable structured evidence, expose how the programming behaves, and export information that can be studied when designing NAS FM's schedule?
 
 If not, Phase 2 is not complete.
+
+---
+
+# 33. Desktop Release Gate (Mandatory)
+
+This is a permanent rule, not a per-batch checklist. It applies to every future desktop release, not only the batch that introduced it. CLAUDE.md's "Desktop release gate" section points here.
+
+A desktop release is NOT complete unless all of the following hold:
+
+```text
+Auto Update is implemented and enabled.
+Update metadata/feed is valid.
+Update packages are cryptographically signed where required.
+Signing private keys/secrets are never committed.
+Every release uses a new version number and new installer assets.
+An installed older updater-capable version is successfully updated to the newer version.
+User data/settings/database survive the update unchanged.
+Update failure is surfaced cleanly without corrupting the installation.
+```
+
+## Real validation, not structural validation
+
+Do not count any of the following as proof the updater works:
+
+- the updater plugin is registered in the Tauri config;
+- an update manifest/feed JSON validates against a schema;
+- a signature verifies in isolation, outside the app's own update flow;
+- the installer builds without error.
+
+The only acceptable proof is a real end-to-end run:
+
+```text
+Install an older, updater-capable build
+→ launch it
+→ it detects the newer version
+→ downloads the update
+→ verifies the signature
+→ installs the update
+→ restarts into the new version
+→ the reported version actually changed
+→ SQLite / session / export data from the old install is still present and intact
+→ no repair or reinstall was needed
+```
+
+## Signing material
+
+- The public verification key is build configuration and may be committed.
+- The private signing key (and any passphrase for it) must never be committed, logged, or
+  pasted into chat output. Keep it outside the repository, e.g. in a local secrets path or a
+  CI secret store.
+- If a private key is ever accidentally exposed (committed, logged, or pasted), treat it as
+  compromised: rotate it and re-sign future releases with a new keypair.
+
+## Versioning and artifacts
+
+- Every release bumps the version number (desktop `package.json`, `tauri.conf.json`, and the
+  Rust crate version together) and produces new installer/update assets.
+- Never overwrite a previously published installer, update package, or manifest entry for an
+  already-released version. A fix ships as a new version, not a silent replacement.
