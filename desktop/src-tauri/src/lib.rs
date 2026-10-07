@@ -307,6 +307,8 @@ pub fn run() {
                     // silent exit while a run is active.
                     api.prevent_close();
                     let _ = window.emit("confirm-exit", json!({"run_id": run_id}));
+                } else {
+                    window.app_handle().exit(0);
                 }
             }
         })
