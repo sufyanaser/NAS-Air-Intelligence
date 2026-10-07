@@ -6,7 +6,8 @@ from collections import Counter
 from typing import Any
 
 from ..util import parse_iso, utc_now
-from .timeline import TimelineSegment
+from .timeline import TimelineSegment, compute_timeline_coverage
+from .validity import AnalyticalValidity, evaluate_analytical_validity
 
 PASS, WARN, FAIL, INFO = "pass", "warn", "fail", "info"
 
@@ -155,16 +156,76 @@ def evaluate_gates(
     )
 
     # TIMELINE: can the session be reconstructed?
-    covered = sum(s.duration_seconds for s in segments if s.kind != "capture_gap")
+    cov_metrics = compute_timeline_coverage(chunks, segments)
+    covered = cov_metrics.unique_covered_seconds
+    cov_pct = cov_metrics.coverage_percent
     if not segments:
         status, detail = FAIL, "timeline is empty"
-    elif captured and covered / captured < 0.98:
-        status, detail = WARN, f"timeline covers {covered / captured:.0%} of captured audio"
+    elif captured and cov_pct < 98.0:
+        status, detail = WARN, f"timeline covers {cov_pct:.1f}% of captured audio"
     else:
-        status, detail = PASS, f"{len(segments)} segments, full coverage of captured audio"
-    gates.append(_gate("timeline", status, detail, segments=len(segments),
-                       covered_seconds=round(covered, 1)))  # fmt: skip
+        status, detail = (
+            PASS,
+            f"{len(segments)} segments, {cov_pct:.1f}% coverage of captured audio",
+        )
+    gates.append(
+        _gate(
+            "timeline",
+            status,
+            detail,
+            segments=len(segments),
+            unique_covered_seconds=round(covered, 1),
+            coverage_percent=cov_pct,
+            gap_seconds=round(cov_metrics.gap_seconds, 1),
+            overlap_seconds=round(cov_metrics.overlap_seconds, 1),
+        )
+    )
     return gates
+
+
+def evaluate_session_validity(
+    *,
+    session: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    incidents: list[dict[str, Any]],
+    segments: list[TimelineSegment],
+    requested_seconds: float,
+    expects_transcription: bool,
+    is_dependency_unavailable: bool = False,
+) -> AnalyticalValidity:
+    """Evaluate comprehensive analytical validity for the session."""
+    captured = sum(float(c["duration_seconds"]) for c in chunks)
+    speech = [e for e in events if e["kind"] == "speech" and e.get("text")]
+    failures = sum(
+        1 for i in incidents if i["kind"] in {"analysis_failure", "transcription_incident"}
+    )
+    critical = sum(1 for i in incidents if i["kind"] in {"capture_error", "monitor_error"})
+    confs = [float(e["confidence"]) for e in speech if e.get("confidence") is not None]
+    mean_conf = sum(confs) / len(confs) if confs else None
+    cov = compute_timeline_coverage(chunks, segments)
+
+    finished = session.get("ended_at") is not None
+    end = parse_iso(session["ended_at"]) if finished else utc_now()
+    elapsed = (end - parse_iso(session["started_at"])).total_seconds()
+    expected = min(requested_seconds, elapsed) if elapsed > 0 else requested_seconds
+
+    return evaluate_analytical_validity(
+        has_chunks=bool(chunks),
+        captured_seconds=captured,
+        expected_seconds=expected,
+        chunk_count=len(chunks),
+        unanalyzed_chunks=sum(1 for c in chunks if not c["analyzed"]),
+        expects_transcription=expects_transcription,
+        transcription_failures=failures,
+        speech_events_count=len(speech),
+        mean_speech_confidence=mean_conf,
+        timeline_coverage_percent=cov.coverage_percent,
+        critical_incidents_count=critical,
+        stopped_early=(session.get("status") == "stopped"),
+        is_dependency_unavailable=is_dependency_unavailable,
+        is_insufficient_sample=(captured < 3600.0),
+    )
 
 
 def verdict(gates: list[dict[str, Any]], *, has_chunks: bool) -> tuple[str, list[str]]:

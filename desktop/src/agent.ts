@@ -32,6 +32,17 @@ export interface AgentResultSummary {
   gates: Record<string, "pass" | "warn" | "fail">;
   executive_summary: string;
   review_problems: string[];
+  validity?: {
+    capture_status: string;
+    processing_status: string;
+    transcription_status: string;
+    classification_status: string;
+    programming_analysis_status: string;
+    decision_readiness: "READY" | "LIMITED" | "NOT_READY";
+    reasons: string[];
+    limitations: string[];
+  };
+  decision_readiness?: "READY" | "LIMITED" | "NOT_READY";
 }
 
 export interface AgentStatus {

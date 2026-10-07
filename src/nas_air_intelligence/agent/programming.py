@@ -7,36 +7,53 @@ radio-monitoring-agent-context.md section 5 explicit:
 
     OBSERVED              - a direct measurement (a ratio, a count).
     INFERRED              - an interpretation of a recurring pattern, with evidence/occurrences.
-    NAS FM PLANNING INPUT - a cautious, non-copying suggestion, only attached to an INFERRED row.
+    NAS_FM_PLANNING_INPUT - a cautious, non-copying suggestion, only attached to an INFERRED row.
 
-Nothing here ever names a "program", claims music/jingle/advertisement, or treats a single
-session as proof of a lasting schedule pattern - see the confidence formulas, which are all
-capped well below certainty and scale down for a single session with few occurrences.
+Hard analytical gates:
+- If transcription is required and failed, speech is NEVER reported as 0,
+  non-speech is NEVER inferred, and programming analysis is strictly BLOCKED.
+- UNKNOWN is a valid evidence state and NEVER becomes non-speech, music,
+  advertisement, jingle, presenter, or program.
+- Multi-hour daypart conclusions are strictly blocked on short samples (INSUFFICIENT_SAMPLE).
 """
 
 from __future__ import annotations
 
 import statistics
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
 from typing import Any
 
 from ..db import Database
 from ..util import isoformat, parse_iso
-from .timeline import TimelineSegment, build_timeline, recurrent_candidates, station_timezone
+from .sufficiency import (
+    assess_candidate_sufficiency,
+    assess_clock_sufficiency,
+    assess_daypart_sufficiency,
+)
+from .timeline import (
+    TimelineSegment,
+    build_timeline,
+    compute_timeline_coverage,
+    recurrent_candidates,
+    station_timezone,
+    timezone_metadata,
+)
+from .validity import (
+    ClassificationStatus,
+    EvidenceClass,
+    ProgrammingAnalysisStatus,
+    SufficiencyStatus,
+    TranscriptionStatus,
+    evaluate_analytical_validity,
+)
 
-# A segment of a different lean shorter than this is folded into the surrounding content
-# block instead of splitting it; at or above it, it only splits the block if its lean also
-# differs from what the block has accumulated so far. See content_blocks() for the full rule.
 BLOCK_SPLIT_THRESHOLD_SECONDS = 60.0
 MIN_CANDIDATE_BLOCK_SECONDS = 60.0
 CLOCK_BUCKET_MINUTES = 10
 SPEECH_CLUSTER_BUCKET_MINUTES = 5
 
-# Display order and labels only; the absolute boundaries for a given moment are computed by
-# _daypart_at, which handles the Night wraparound past midnight explicitly rather than with
-# modular-arithmetic tricks that are easy to get subtly wrong at the midnight boundary.
 DAYPART_ORDER = ["Morning", "Midday", "Afternoon", "Evening", "Night", "Overnight"]
 DAYPART_LABELS = {
     "Morning": "06:00–10:00",
@@ -53,7 +70,7 @@ def _lean(kind: str) -> str:
         return "speech"
     if kind in {"silence", "capture_gap"}:
         return "silence"
-    return "unknown"  # unknown_audio, and any future ML label: never assumed to be music
+    return "unknown"  # UNKNOWN is never assumed to be non-speech or music
 
 
 def _daypart_at(dt: datetime, tz: tzinfo) -> tuple[str, datetime, datetime]:
@@ -71,9 +88,6 @@ def _daypart_at(dt: datetime, tz: tzinfo) -> tuple[str, datetime, datetime]:
         return "Evening", midnight + timedelta(hours=18), midnight + timedelta(hours=22)
     if 2 <= hour < 6:
         return "Overnight", midnight + timedelta(hours=2), midnight + timedelta(hours=6)
-    # Night: 22:00-02:00, spanning midnight. hour >= 22 is tonight's start; hour < 2 is the
-    # tail end of a Night that started yesterday evening - both must resolve to the SAME
-    # absolute window as the one actually containing dt, not "today's" Night by coincidence.
     if hour >= 22:
         return "Night", midnight + timedelta(hours=22), midnight + timedelta(days=1, hours=2)
     return "Night", midnight - timedelta(hours=2), midnight + timedelta(hours=2)
@@ -85,11 +99,16 @@ def _daypart_name(dt: datetime, tz: tzinfo) -> str:
 
 @dataclass
 class ContentBlock:
+    id: str
     start: datetime
     end: datetime
-    block_type: str
+    block_type: str  # "speech-heavy" | "silence" | "unknown" | "mixed"
     lean_seconds: dict[str, float]
     evidence_event_ids: list[str]
+    chunk_ids: list[str] = field(default_factory=list)
+    source_audio_files: list[str] = field(default_factory=list)
+    confidence_basis: str = ""
+    limitations: list[str] = field(default_factory=list)
     notes: str | None = None
 
     @property
@@ -101,39 +120,64 @@ class ContentBlock:
         total = sum(self.lean_seconds.values())
         if total <= 0:
             return 0.0
-        # The duration-weighted share of the block that rests on firm (non-"unknown") evidence.
         firm = total - self.lean_seconds.get("unknown", 0.0)
         return round(max(0.0, min(1.0, firm / total)), 3)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.id,
             "start": isoformat(self.start),
             "end": isoformat(self.end),
             "duration_seconds": round(self.duration_seconds, 1),
             "block_type": self.block_type,
             "confidence": self.confidence,
+            "confidence_basis": self.confidence_basis
+            or "Duration-weighted share of verified evidence",
             "evidence_event_ids": self.evidence_event_ids,
+            "chunk_ids": self.chunk_ids,
+            "source_audio_files": self.source_audio_files,
+            "limitations": self.limitations,
             "notes": self.notes,
         }
 
 
 @dataclass
 class ProgramCandidate:
+    id: str
     bucket_minute: int
     block_type: str
     occurrences: int
     mean_duration_seconds: float
-    evidence: list[str]  # ISO start timestamps of each occurrence
+    evidence: list[str]
     confidence: float
+    confidence_basis: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
+    sufficiency_status: SufficiencyStatus = SufficiencyStatus.LIMITED
+    sample_seconds: float = 0.0
+    expected_window_seconds: float = 7200.0
+    coverage_ratio: float = 0.0
+    sessions_count: int = 1
+    days_count: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.id,
             "bucket": f":{self.bucket_minute:02d}",
             "block_type": self.block_type,
             "occurrences": self.occurrences,
             "mean_duration_seconds": round(self.mean_duration_seconds, 1),
             "evidence": self.evidence,
-            "confidence": self.confidence,
+            "confidence": round(self.confidence, 3),
+            "confidence_basis": self.confidence_basis,
+            "evidence_refs": self.evidence_refs,
+            "limitations": self.limitations,
+            "sufficiency_status": self.sufficiency_status.value,
+            "sample_seconds": round(self.sample_seconds, 1),
+            "expected_window_seconds": round(self.expected_window_seconds, 1),
+            "coverage_ratio": round(self.coverage_ratio, 4),
+            "sessions_count": self.sessions_count,
+            "days_count": self.days_count,
         }
 
 
@@ -144,6 +188,15 @@ class ClockPattern:
     occurrences: int
     evidence: list[str]
     confidence: float
+    confidence_basis: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+    limitations: list[str] = field(default_factory=list)
+    sufficiency_status: SufficiencyStatus = SufficiencyStatus.LIMITED
+    sample_seconds: float = 0.0
+    expected_window_seconds: float = 3600.0
+    coverage_ratio: float = 0.0
+    sessions_count: int = 1
+    days_count: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -152,6 +205,15 @@ class ClockPattern:
             "occurrences": self.occurrences,
             "evidence": self.evidence,
             "confidence": round(self.confidence, 3),
+            "confidence_basis": self.confidence_basis,
+            "evidence_refs": self.evidence_refs,
+            "limitations": self.limitations,
+            "sufficiency_status": self.sufficiency_status.value,
+            "sample_seconds": round(self.sample_seconds, 1),
+            "expected_window_seconds": round(self.expected_window_seconds, 1),
+            "coverage_ratio": round(self.coverage_ratio, 4),
+            "sessions_count": self.sessions_count,
+            "days_count": self.days_count,
         }
 
 
@@ -160,14 +222,23 @@ class DaypartStat:
     name: str
     window: str
     monitored_seconds: float
-    speech_seconds: float
-    unknown_seconds: float
-    silence_seconds: float
+    speech_seconds: float | None
+    unknown_seconds: float | None
+    silence_seconds: float | None
     avg_block_duration_seconds: float | None
     presenter_return_interval_seconds: float | None
     recurrent_element_count: int
     program_candidate_count: int
     confidence: float
+    confidence_basis: str
+    evidence_refs: list[str]
+    limitations: list[str]
+    sufficiency_status: SufficiencyStatus
+    sample_seconds: float
+    expected_window_seconds: float
+    coverage_ratio: float
+    sessions_count: int
+    days_count: int
     observations: list[dict[str, Any]]
 
     def to_dict(self) -> dict[str, Any]:
@@ -175,9 +246,15 @@ class DaypartStat:
             "daypart": self.name,
             "window": self.window,
             "monitored_seconds": round(self.monitored_seconds, 1),
-            "speech_seconds": round(self.speech_seconds, 1),
-            "unknown_seconds": round(self.unknown_seconds, 1),
-            "silence_seconds": round(self.silence_seconds, 1),
+            "speech_seconds": (
+                round(self.speech_seconds, 1) if self.speech_seconds is not None else None
+            ),
+            "unknown_seconds": (
+                round(self.unknown_seconds, 1) if self.unknown_seconds is not None else None
+            ),
+            "silence_seconds": (
+                round(self.silence_seconds, 1) if self.silence_seconds is not None else None
+            ),
             "avg_block_duration_seconds": (
                 round(self.avg_block_duration_seconds, 1)
                 if self.avg_block_duration_seconds is not None
@@ -191,26 +268,49 @@ class DaypartStat:
             "recurrent_element_count": self.recurrent_element_count,
             "program_candidate_count": self.program_candidate_count,
             "confidence": round(self.confidence, 3),
+            "confidence_basis": self.confidence_basis,
+            "evidence_refs": self.evidence_refs,
+            "limitations": self.limitations,
+            "sufficiency_status": self.sufficiency_status.value,
+            "sample_seconds": round(self.sample_seconds, 1),
+            "expected_window_seconds": round(self.expected_window_seconds, 1),
+            "coverage_ratio": round(self.coverage_ratio, 4),
+            "sessions_count": self.sessions_count,
+            "days_count": self.days_count,
             "observations": self.observations,
         }
 
 
 @dataclass
 class Insight:
-    type: str  # OBSERVED | INFERRED | RECOMMENDATION
+    classification: EvidenceClass  # OBSERVED | INFERRED | NAS_FM_PLANNING_INPUT
     observation: str
     evidence: str
     occurrences: int
-    confidence: float | None
+    confidence: float
+    confidence_basis: str
+    evidence_refs: list[str]
+    limitations: list[str] = field(default_factory=list)
     nas_fm_planning_input: str | None = None
+    type: str = ""  # compatibility alias for classification
+
+    def __post_init__(self) -> None:
+        if not self.type:
+            self.type = self.classification.value
+        if not (0.0 <= self.confidence <= 1.0):
+            self.confidence = max(0.0, min(1.0, self.confidence))
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "type": self.type,
+            "classification": self.classification.value,
+            "type": self.type or self.classification.value,
             "observation": self.observation,
             "evidence": self.evidence,
             "occurrences": self.occurrences,
-            "confidence": round(self.confidence, 3) if self.confidence is not None else None,
+            "confidence": round(self.confidence, 3),
+            "confidence_basis": self.confidence_basis,
+            "evidence_refs": self.evidence_refs,
+            "limitations": self.limitations,
             "nas_fm_planning_input": self.nas_fm_planning_input,
         }
 
@@ -219,18 +319,9 @@ class Insight:
 def content_blocks(
     chunks: list[dict[str, Any]], events: list[dict[str, Any]]
 ) -> list[ContentBlock]:
-    """Group adjacent timeline segments into larger, honestly-typed blocks.
-
-    A new block starts only when a segment of a different lean is itself substantial
-    (>= BLOCK_SPLIT_THRESHOLD_SECONDS - a sustained run, not a blip) AND that lean does not
-    already match the block accumulated so far; anything shorter is folded in regardless of
-    lean, since a brief pause or a brief burst does not change what the block mostly is. Two
-    segments that are each too short to force a split, but of different leans, legitimately
-    produce a "mixed" block - that classification comes from the final duration-weighted
-    fractions below, not from a separate code path. A real capture gap always ends a block
-    outright: it means the recorder was not even running, which is not programming content.
-    """
+    """Group adjacent timeline segments into honestly-typed blocks with full traceability."""
     segments = build_timeline(chunks, events)
+    chunk_map: dict[str, dict[str, Any]] = {c["id"]: c for c in chunks}
     chunk_window: dict[str, tuple[datetime, datetime]] = {
         c["id"]: (
             parse_iso(c["started_at"]),
@@ -239,23 +330,39 @@ def content_blocks(
         for c in chunks
     }
 
-    def _event_ids_in(start: datetime, end: datetime) -> list[str]:
-        ids = []
+    def _events_and_chunks_in(
+        start: datetime, end: datetime
+    ) -> tuple[list[str], list[str], list[str]]:
+        event_ids, chunk_ids, audio_files = [], set(), set()
         for event in events:
-            window = chunk_window.get(event.get("chunk_id"))
-            if not window:
+            c_id = event.get("chunk_id")
+            window = chunk_window.get(c_id) if c_id else None
+            if not window or not c_id:
                 continue
-            c_start, _c_end = window
+            c_start, _ = window
             e_start = c_start + timedelta(seconds=float(event["start_offset"]))
             e_end = c_start + timedelta(seconds=float(event["end_offset"]))
             if e_start < end and e_end > start:
-                ids.append(event["id"])
-        return ids
+                event_ids.append(event["id"])
+                chunk_ids.add(c_id)
+                chunk_obj = chunk_map.get(c_id)
+                if chunk_obj and chunk_obj.get("path"):
+                    audio_files.add(chunk_obj["path"])
+        # Also include chunks that overlap the block even if no events in that subsegment
+        for c_id, (c_start, c_end) in chunk_window.items():
+            if c_start < end and c_end > start:
+                chunk_ids.add(c_id)
+                chunk_obj = chunk_map.get(c_id)
+                if chunk_obj and chunk_obj.get("path"):
+                    audio_files.add(chunk_obj["path"])
+        return event_ids, sorted(chunk_ids), sorted(audio_files)
 
     blocks: list[ContentBlock] = []
     members: list[TimelineSegment] = []
+    block_index = 1
 
     def _flush() -> None:
+        nonlocal block_index
         if not members:
             return
         totals: dict[str, float] = defaultdict(float)
@@ -265,6 +372,7 @@ def content_blocks(
         speech_frac = totals.get("speech", 0.0) / total if total else 0.0
         silence_frac = totals.get("silence", 0.0) / total if total else 0.0
         unknown_frac = totals.get("unknown", 0.0) / total if total else 0.0
+
         if speech_frac >= 0.6:
             block_type = "speech-heavy"
         elif silence_frac >= 0.6:
@@ -273,19 +381,38 @@ def content_blocks(
             block_type = "non-speech/unknown"
         else:
             block_type = "mixed"
+
         start, end = members[0].start, members[-1].end
+        event_ids, c_ids, audio_paths = _events_and_chunks_in(start, end)
         dominant = max(totals, key=lambda k: totals[k]) if totals else "unknown"
         folded = [s for s in members if _lean(s.kind) != dominant]
         notes = None
         if folded:
             folded_seconds = sum(s.duration_seconds for s in folded)
             notes = f"includes {len(folded)} short interruption(s) totaling {folded_seconds:.1f}s"
+
+        limitations = []
+        if block_type == "unknown":
+            limitations.append("Unclassified audio interval; not verified as music or non-speech.")
+
         blocks.append(
             ContentBlock(
-                start=start, end=end, block_type=block_type, lean_seconds=dict(totals),
-                evidence_event_ids=_event_ids_in(start, end), notes=notes,
-            )  # fmt: skip
+                id=f"blk-{block_index:03d}",
+                start=start,
+                end=end,
+                block_type=block_type,
+                lean_seconds=dict(totals),
+                evidence_event_ids=event_ids,
+                chunk_ids=c_ids,
+                source_audio_files=audio_paths,
+                confidence_basis=(
+                    "Duration-weighted share of verified speech/silence timeline segments"
+                ),
+                limitations=limitations,
+                notes=notes,
+            )
         )
+        block_index += 1
 
     for seg in segments:
         if seg.kind == "capture_gap":
@@ -312,8 +439,20 @@ def content_blocks(
 
 
 # --------------------------------------------------------------------------- program candidates
-def program_candidates(blocks: list[ContentBlock], tz: tzinfo) -> list[ProgramCandidate]:
-    """Recurring, similarly-timed, similarly-typed blocks. Never a claimed program name."""
+def program_candidates(
+    blocks: list[ContentBlock], tz: tzinfo, total_sample_seconds: float = 0.0
+) -> list[ProgramCandidate]:
+    """Recurring, similarly-timed, similarly-typed blocks.
+
+    Enforces sample sufficiency: blocked if total sample is under 1 hour.
+    """
+    if total_sample_seconds <= 0.0 and blocks:
+        total_sample_seconds = (blocks[-1].end - blocks[0].start).total_seconds()
+
+    if total_sample_seconds < 3600.0:
+        # Sample under 1 hour cannot establish multi-hour program candidates
+        return []
+
     eligible = [
         b
         for b in blocks
@@ -327,36 +466,58 @@ def program_candidates(blocks: list[ContentBlock], tz: tzinfo) -> list[ProgramCa
         groups[(block.block_type, bucket)].append(block)
 
     candidates: list[ProgramCandidate] = []
+    cand_index = 1
     for (block_type, bucket), members in groups.items():
         hours = {m.start.astimezone(tz).hour for m in members}
         if len(members) < 2 or len(hours) < 2:
-            continue  # recurrence requires more than one occurrence in more than one hour
+            continue
         durations = [m.duration_seconds for m in members]
         mean_duration = statistics.mean(durations)
         stdev = statistics.pstdev(durations) if len(durations) > 1 else 0.0
         consistency = max(0.0, 1.0 - (stdev / mean_duration if mean_duration else 1.0))
         confidence = min(0.9, 0.3 + 0.15 * (len(members) - 1)) * (0.5 + 0.5 * consistency)
+
+        suff = assess_candidate_sufficiency(
+            sample_seconds=total_sample_seconds,
+            occurrences=len(members),
+            hours_spanned=len(hours),
+        )
+        evidence_refs = [f"block:{b.id}" for b in members]
+
         candidates.append(
             ProgramCandidate(
-                bucket_minute=bucket, block_type=block_type, occurrences=len(members),
+                id=f"cand-{cand_index:03d}",
+                bucket_minute=bucket,
+                block_type=block_type,
+                occurrences=len(members),
                 mean_duration_seconds=mean_duration,
                 evidence=sorted(isoformat(m.start) for m in members),
                 confidence=round(confidence, 3),
-            )  # fmt: skip
+                confidence_basis=(
+                    f"Recurrence across {len(hours)} distinct hours "
+                    f"with duration consistency {consistency:.2f}"
+                ),
+                evidence_refs=evidence_refs,
+                limitations=[
+                    "Program candidate only; does not name a specific program or format",
+                    "Requires multi-day confirmation before schedule planning",
+                ],
+                sufficiency_status=suff.sufficiency_status,
+                sample_seconds=total_sample_seconds,
+                expected_window_seconds=suff.expected_window_seconds,
+                coverage_ratio=suff.coverage_ratio,
+                sessions_count=1,
+                days_count=1,
+            )
         )
+        cand_index += 1
     candidates.sort(key=lambda c: (-c.occurrences, -c.confidence))
     return candidates
 
 
 # ------------------------------------------------------------------------------- clock patterns
 def presenter_return_intervals(blocks: list[ContentBlock]) -> list[float]:
-    """Gaps between consecutive speech-led content blocks' start times.
-
-    Deliberately NOT computed from raw per-chunk speech segments: Whisper naturally splits
-    one continuous conversation into many short segments with brief pauses between them, so
-    a segment-to-segment gap measures breathing room, not how often the presenter actually
-    returns after other material. A content block already folds those short pauses in.
-    """
+    """Gaps between consecutive speech-led content blocks' start times."""
     speech_led = sorted(
         (b for b in blocks if b.block_type in {"speech-heavy", "mixed"}), key=lambda b: b.start
     )
@@ -367,20 +528,43 @@ def presenter_return_intervals(blocks: list[ContentBlock]) -> list[float]:
 
 
 def clock_patterns(
-    events: list[dict[str, Any]], chunks: list[dict[str, Any]], blocks: list[ContentBlock],
-    segments: list[TimelineSegment], tz: tzinfo,
-) -> list[ClockPattern]:  # fmt: skip
+    events: list[dict[str, Any]],
+    chunks: list[dict[str, Any]],
+    blocks: list[ContentBlock],
+    segments: list[TimelineSegment],
+    tz: tzinfo,
+    total_sample_seconds: float = 0.0,
+) -> list[ClockPattern]:
+    """Extract hourly broadcast clock patterns.
+
+    Enforces sample sufficiency: blocked if total sample is under 1 hour.
+    """
+    if total_sample_seconds <= 0.0:
+        if blocks:
+            total_sample_seconds = (blocks[-1].end - blocks[0].start).total_seconds()
+        elif chunks:
+            total_sample_seconds = (
+                parse_iso(chunks[-1]["started_at"]) - parse_iso(chunks[0]["started_at"])
+            ).total_seconds() + float(chunks[-1].get("duration_seconds", 0.0))
+        elif segments:
+            total_sample_seconds = (segments[-1].end - segments[0].start).total_seconds()
+
+    if total_sample_seconds < 3600.0:
+        return []
+
     patterns: list[ClockPattern] = []
     speech_led = sorted(
         (b for b in blocks if b.block_type in {"speech-heavy", "mixed"}), key=lambda b: b.start
     )
     intervals = presenter_return_intervals(blocks)
+    clock_suff = assess_clock_sufficiency(sample_seconds=total_sample_seconds)
 
     if len(intervals) >= 2:
         mean_interval = statistics.mean(intervals)
         stdev_interval = statistics.pstdev(intervals) if len(intervals) > 1 else 0.0
         consistency = max(0.0, 1.0 - (stdev_interval / mean_interval if mean_interval else 1.0))
         confidence = min(0.85, 0.3 + 0.03 * len(intervals)) * (0.4 + 0.6 * consistency)
+        evidence_refs = [f"block:{b.id}" for b in speech_led]
         patterns.append(
             ClockPattern(
                 pattern_type="presenter_return_interval",
@@ -389,6 +573,16 @@ def clock_patterns(
                 occurrences=len(speech_led),
                 evidence=[isoformat(b.start) for b in (speech_led[:3] + speech_led[-3:])],
                 confidence=confidence,
+                confidence_basis=(
+                    f"Calculated from {len(intervals)} speech-led content block "
+                    f"intervals (consistency {consistency:.2f})"
+                ),
+                evidence_refs=evidence_refs[:10],
+                limitations=["Measures block-to-block cadence, not individual utterance intervals"],
+                sufficiency_status=clock_suff.sufficiency_status,
+                sample_seconds=total_sample_seconds,
+                expected_window_seconds=clock_suff.expected_window_seconds,
+                coverage_ratio=clock_suff.coverage_ratio,
             )
         )
 
@@ -413,6 +607,15 @@ def clock_patterns(
                     occurrences=count,
                     evidence=sorted(bucket_examples[bucket])[:5],
                     confidence=min(0.6, 0.15 * ratio),
+                    confidence_basis=f"Cluster ratio {ratio:.2f} relative to hourly average",
+                    evidence_refs=[f"event:{e['id']}" for e in events[:5]],
+                    limitations=[
+                        "Single-station sample; cluster may reflect a specific program format"
+                    ],
+                    sufficiency_status=clock_suff.sufficiency_status,
+                    sample_seconds=total_sample_seconds,
+                    expected_window_seconds=clock_suff.expected_window_seconds,
+                    coverage_ratio=clock_suff.coverage_ratio,
                 )
             )
 
@@ -435,6 +638,18 @@ def clock_patterns(
                 occurrences=candidate["occurrences"],
                 evidence=candidate["chunk_starts"][:5],
                 confidence=min(0.5, 0.15 * candidate["occurrences"]),
+                confidence_basis=(
+                    f"Exact fingerprint match across {candidate['occurrences']} chunks"
+                ),
+                evidence_refs=[f"fingerprint:{candidate['fingerprint_prefix']}"],
+                limitations=[
+                    "Acoustic fingerprint match only; semantic identity not verified",
+                    "Do not label as jingle, promo, or advertisement without verification",
+                ],
+                sufficiency_status=clock_suff.sufficiency_status,
+                sample_seconds=total_sample_seconds,
+                expected_window_seconds=clock_suff.expected_window_seconds,
+                coverage_ratio=clock_suff.coverage_ratio,
             )
         )
     return patterns
@@ -447,7 +662,18 @@ def daypart_analysis(
     candidates: list[ProgramCandidate],
     patterns: list[ClockPattern],
     tz: tzinfo,
+    *,
+    transcription_valid: bool = True,
 ) -> list[DaypartStat]:
+    """Analyze dayparts with sample sufficiency and analytical validity gates.
+
+    If transcription is invalid/failed:
+    - speech_seconds is None (UNAVAILABLE, never 0)
+    - unknown_seconds is None (never inferred as non-speech)
+    - observations do not claim speech or non-speech ratios.
+    If sample is INSUFFICIENT_SAMPLE:
+    - observations do not make sweeping claims about the daypart.
+    """
     audio = [s for s in segments if s.kind != "capture_gap"]
     totals: dict[str, dict[str, float]] = {name: defaultdict(float) for name in DAYPART_ORDER}
 
@@ -465,6 +691,8 @@ def daypart_analysis(
         monitored = sum(t.values())
         if monitored <= 0:
             continue
+
+        suff = assess_daypart_sufficiency(sample_seconds=monitored)
         in_daypart_blocks = [b for b in blocks if _daypart_name(b.start, tz) == name]
         avg_block = (
             statistics.mean(b.duration_seconds for b in in_daypart_blocks)
@@ -472,7 +700,11 @@ def daypart_analysis(
             else None
         )
         daypart_gaps = presenter_return_intervals(in_daypart_blocks)
-        presenter_interval = statistics.median(daypart_gaps) if len(daypart_gaps) >= 2 else None
+        presenter_interval = (
+            statistics.median(daypart_gaps)
+            if (transcription_valid and len(daypart_gaps) >= 2)
+            else None
+        )
         recurrent_here = sum(
             1
             for p in patterns
@@ -484,43 +716,85 @@ def daypart_analysis(
             for c in candidates
             if any(_daypart_name(parse_iso(e), tz) == name for e in c.evidence)
         )
-        coverage_fraction = min(1.0, monitored / (4.0 * 3600.0))  # every daypart window is 4h
-        confidence = round(min(0.8, 0.2 + 0.6 * coverage_fraction), 3)
+
+        coverage_fraction = suff.coverage_ratio
+        confidence = (
+            round(min(0.8, 0.2 + 0.6 * coverage_fraction), 3) if transcription_valid else 0.0
+        )
 
         observations: list[dict[str, Any]] = []
-        speech_s = t.get("speech", 0.0)
-        unknown_s = t.get("unknown", 0.0)
-        silence_s = t.get("silence", 0.0)
-        if monitored >= 300:
-            speech_pct = round(speech_s / monitored * 100, 1)
-            observations.append(
-                {
-                    "type": "OBSERVED",
-                    "text": f"Speech-classified time is {speech_pct}% of monitored time "
-                    f"in the {name} daypart.",
-                    "confidence": confidence,
-                }
+        limitations: list[str] = []
+
+        if not transcription_valid:
+            speech_s = None
+            unknown_s = None
+            silence_s = round(t.get("silence", 0.0), 1)
+            limitations.append(
+                "Speech and non-speech ratios are UNAVAILABLE because transcription failed."
             )
-            if unknown_s + silence_s > speech_s:
+        else:
+            speech_s = t.get("speech", 0.0)
+            unknown_s = t.get("unknown", 0.0)
+            silence_s = t.get("silence", 0.0)
+
+            if suff.sufficiency_status == SufficiencyStatus.INSUFFICIENT_SAMPLE:
+                limitations.append(
+                    f"Sample covers only {monitored:.0f}s ({coverage_fraction:.1%}) "
+                    f"of the 4h {name} daypart. Insufficient to characterize the broadcast format."
+                )
+            else:
+                speech_pct = round(speech_s / monitored * 100, 1)
                 observations.append(
                     {
                         "type": "OBSERVED",
-                        "text": f"Non-speech/unknown audio dominates the {name} daypart "
-                        f"({round((unknown_s + silence_s) / monitored * 100, 1)}% of "
-                        "monitored time).",
+                        "text": (
+                            f"Speech-classified time is {speech_pct}% of monitored "
+                            f"time in the {name} daypart."
+                        ),
                         "confidence": confidence,
                     }
                 )
+                if unknown_s + silence_s > speech_s:
+                    unk_sil_pct = round((unknown_s + silence_s) / monitored * 100, 1)
+                    observations.append(
+                        {
+                            "type": "OBSERVED",
+                            "text": (
+                                f"Unclassified audio exceeds speech in the {name} "
+                                f"daypart sample ({unk_sil_pct}%)."
+                            ),
+                            "confidence": confidence,
+                        }
+                    )
+
+        evidence_refs = [f"block:{b.id}" for b in in_daypart_blocks]
 
         stats.append(
             DaypartStat(
-                name=name, window=DAYPART_LABELS[name], monitored_seconds=monitored,
-                speech_seconds=speech_s, unknown_seconds=unknown_s, silence_seconds=silence_s,
+                name=name,
+                window=DAYPART_LABELS[name],
+                monitored_seconds=monitored,
+                speech_seconds=speech_s,
+                unknown_seconds=unknown_s,
+                silence_seconds=silence_s,
                 avg_block_duration_seconds=avg_block,
                 presenter_return_interval_seconds=presenter_interval,
-                recurrent_element_count=recurrent_here, program_candidate_count=candidates_here,
-                confidence=confidence, observations=observations,
-            )  # fmt: skip
+                recurrent_element_count=recurrent_here,
+                program_candidate_count=candidates_here,
+                confidence=confidence,
+                confidence_basis=(
+                    f"Measured across {monitored:.0f}s of captured audio in {DAYPART_LABELS[name]}"
+                ),
+                evidence_refs=evidence_refs[:10],
+                limitations=limitations,
+                sufficiency_status=suff.sufficiency_status,
+                sample_seconds=suff.sample_seconds,
+                expected_window_seconds=suff.expected_window_seconds,
+                coverage_ratio=suff.coverage_ratio,
+                sessions_count=suff.sessions_count,
+                days_count=suff.days_count,
+                observations=observations,
+            )
         )
     return stats
 
@@ -531,20 +805,72 @@ def programming_diagnostics(
     blocks: list[ContentBlock],
     candidates: list[ProgramCandidate],
     patterns: list[ClockPattern],
+    *,
+    transcription_valid: bool = True,
+    total_captured_seconds: float = 0.0,
+    failures_count: int = 0,
 ) -> list[Insight]:
+    """Generate programming diagnostics with strict evidence classification."""
     insights: list[Insight] = []
     audio = [s for s in segments if s.kind != "capture_gap"]
     covered = sum(s.duration_seconds for s in audio)
-    speech_total = sum(s.duration_seconds for s in audio if s.kind == "speech")
-    if covered > 0:
+
+    # HARD GATE: If transcription failed/unavailable, strictly REFUSE any speech or format claims
+    if not transcription_valid:
         insights.append(
             Insight(
+                classification=EvidenceClass.OBSERVED,
                 type="OBSERVED",
-                observation=f"Speech-classified time is {speech_total / covered * 100:.1f}% "
-                f"of the {covered:.0f}s of covered audio.",
-                evidence=f"{sum(1 for s in audio if s.kind == 'speech')} speech segment(s)",
-                occurrences=sum(1 for s in audio if s.kind == "speech"),
+                observation=(
+                    f"Programming analysis is BLOCKED: audio capture completed "
+                    f"({total_captured_seconds:.0f}s), but transcription/classification "
+                    f"dependencies failed ({failures_count} failure incidents)."
+                ),
+                evidence=f"{failures_count} transcription failure incident(s) recorded",
+                occurrences=failures_count,
                 confidence=1.0,
+                confidence_basis=(
+                    "Direct incident verification; technical failure is not converted "
+                    "to programming evidence"
+                ),
+                evidence_refs=[f"block:{b.id}" for b in blocks[:5]],
+                limitations=[
+                    "Speech duration is UNAVAILABLE (not zero)",
+                    "Non-speech duration is UNAVAILABLE (not 100%)",
+                    (
+                        "No clock patterns, program candidates, or planning inputs can "
+                        "be inferred without verified evidence"
+                    ),
+                ],
+                nas_fm_planning_input=None,
+            )
+        )
+        return insights
+
+    speech_total = sum(s.duration_seconds for s in audio if s.kind == "speech")
+    speech_segments = [s for s in audio if s.kind == "speech"]
+    if covered > 0 and speech_segments:
+        insights.append(
+            Insight(
+                classification=EvidenceClass.OBSERVED,
+                type="OBSERVED",
+                observation=(
+                    f"Speech-classified time is {speech_total / covered * 100:.1f}% "
+                    f"of the {covered:.0f}s of covered audio."
+                ),
+                evidence=f"{len(speech_segments)} speech segment(s)",
+                occurrences=len(speech_segments),
+                confidence=1.0,
+                confidence_basis="Direct duration sum of verified Whisper speech segments",
+                evidence_refs=[f"block:{b.id}" for b in blocks if b.block_type == "speech-heavy"][
+                    :5
+                ],
+                limitations=[
+                    (
+                        "Applies only to monitored duration; "
+                        "not an average for the full station schedule"
+                    )
+                ],
             )
         )
 
@@ -554,12 +880,18 @@ def programming_diagnostics(
         if pattern.pattern_type == "presenter_return_interval":
             insights.append(
                 Insight(
+                    classification=EvidenceClass.INFERRED,
                     type="INFERRED",
-                    observation=f"Presenter interventions recur: {pattern.description}, "
-                    "suggesting short, frequent segments rather than long uninterrupted blocks.",
-                    evidence=f"{pattern.occurrences} speech segment(s)",
+                    observation=(
+                        f"Presenter interventions recur: {pattern.description}, "
+                        f"suggesting structured short segments."
+                    ),
+                    evidence=f"{pattern.occurrences} speech-led content block(s)",
                     occurrences=pattern.occurrences,
                     confidence=pattern.confidence,
+                    confidence_basis=pattern.confidence_basis,
+                    evidence_refs=pattern.evidence_refs,
+                    limitations=pattern.limitations,
                     nas_fm_planning_input=(
                         "Consider testing comparably short presenter interventions separated "
                         "by non-speech material in the matching NAS FM daypart, then compare "
@@ -570,33 +902,46 @@ def programming_diagnostics(
         elif pattern.pattern_type == "speech_cluster":
             insights.append(
                 Insight(
+                    classification=EvidenceClass.INFERRED,
                     type="INFERRED",
-                    observation=f"Speech blocks cluster around a specific minute position: "
-                    f"{pattern.description}.",
+                    observation=(
+                        f"Speech blocks cluster around a specific minute position: "
+                        f"{pattern.description}."
+                    ),
                     evidence=f"{pattern.occurrences} occurrence(s) at this minute bucket",
                     occurrences=pattern.occurrences,
                     confidence=pattern.confidence,
+                    confidence_basis=pattern.confidence_basis,
+                    evidence_refs=pattern.evidence_refs,
+                    limitations=pattern.limitations,
                     nas_fm_planning_input=(
-                        "A comparable minute-position cue (e.g. a recurring short presenter "
-                        "segment) could be tested as a listener-expectation anchor in the NAS "
-                        "FM clock."
+                        "A comparable minute-position cue could be tested as a "
+                        "listener-expectation anchor in the NAS FM clock."
                     ),
                 )
             )
         elif pattern.pattern_type == "recurrent_element_position":
             insights.append(
                 Insight(
+                    classification=EvidenceClass.INFERRED,
                     type="INFERRED",
-                    observation=f"A recurrent element appears close to a clock landmark: "
-                    f"{pattern.description}.",
-                    evidence=f"{pattern.occurrences} fingerprint occurrence(s) "
-                    "(exact-match acoustic fingerprint, identity not verified)",
+                    observation=(
+                        f"A recurrent element appears close to a clock landmark: "
+                        f"{pattern.description}."
+                    ),
+                    evidence=(
+                        f"{pattern.occurrences} fingerprint occurrence(s) "
+                        f"(acoustic fingerprint, identity unverified)"
+                    ),
                     occurrences=pattern.occurrences,
                     confidence=pattern.confidence,
+                    confidence_basis=pattern.confidence_basis,
+                    evidence_refs=pattern.evidence_refs,
+                    limitations=pattern.limitations,
                     nas_fm_planning_input=(
-                        "Investigate this recurring element as a possible station-imaging or "
-                        "transition cue before drawing conclusions; it is not identified as a "
-                        "jingle, promo, or advertisement, and must not be copied."
+                        "Investigate this recurring element as a possible station-imaging "
+                        "or transition cue before drawing conclusions; it is not identified "
+                        "as a jingle, promo, or advertisement."
                     ),
                 )
             )
@@ -607,57 +952,87 @@ def programming_diagnostics(
         bucket_label = candidate.to_dict()["bucket"]
         insights.append(
             Insight(
+                classification=EvidenceClass.INFERRED,
                 type="INFERRED",
-                observation=f"A {candidate.block_type} block recurs near {bucket_label} of "
-                f"the hour across {candidate.occurrences} monitored hours "
-                f"(mean duration {candidate.mean_duration_seconds:.0f}s).",
+                observation=(
+                    f"A {candidate.block_type} block recurs near {bucket_label} of the hour "
+                    f"across {candidate.occurrences} monitored hours "
+                    f"(mean duration {candidate.mean_duration_seconds:.0f}s)."
+                ),
                 evidence=f"{candidate.occurrences} occurrence(s)",
                 occurrences=candidate.occurrences,
                 confidence=candidate.confidence,
+                confidence_basis=candidate.confidence_basis,
+                evidence_refs=candidate.evidence_refs,
+                limitations=candidate.limitations,
                 nas_fm_planning_input=(
-                    "Treat as a program-candidate signal only; verify over additional "
+                    "Treat as a program-candidate hypothesis only; verify over additional "
                     "monitoring sessions before basing any schedule decision on it."
                 ),
             )
         )
 
-    long_unknown_blocks = [
-        b for b in blocks if b.block_type == "non-speech/unknown" and b.duration_seconds >= 300
-    ]
-    if long_unknown_blocks:
+    unknown_blocks = [b for b in blocks if b.block_type == "unknown" and b.duration_seconds >= 300]
+    if unknown_blocks:
         insights.append(
             Insight(
+                classification=EvidenceClass.OBSERVED,
                 type="OBSERVED",
-                observation=f"Long non-speech/unknown sequences occur: {len(long_unknown_blocks)} "
-                f"block(s) of at least 5 minutes each, totaling "
-                f"{sum(b.duration_seconds for b in long_unknown_blocks):.0f}s.",
-                evidence="content blocks classified non-speech/unknown by duration-weighted lean",
-                occurrences=len(long_unknown_blocks),
+                observation=(
+                    f"Long unclassified audio sequences occur: {len(unknown_blocks)} "
+                    f"block(s) of at least 5 minutes each, totaling "
+                    f"{sum(b.duration_seconds for b in unknown_blocks):.0f}s."
+                ),
+                evidence=f"{len(unknown_blocks)} unclassified block(s) >= 300s",
+                occurrences=len(unknown_blocks),
                 confidence=1.0,
+                confidence_basis="Direct duration measurement of unclassified timeline blocks",
+                evidence_refs=[f"block:{b.id}" for b in unknown_blocks[:5]],
+                limitations=["Unclassified audio is not verified as music, silence, or noise"],
             )
         )
 
-    inferred_with_input = [i for i in insights if i.type == "INFERRED" and i.nas_fm_planning_input]
+    inferred_with_input = [
+        i
+        for i in insights
+        if i.classification == EvidenceClass.INFERRED and i.nas_fm_planning_input
+    ]
     if len(inferred_with_input) >= 2:
         insights.append(
             Insight(
+                classification=EvidenceClass.NAS_FM_PLANNING_INPUT,
                 type="RECOMMENDATION",
-                observation="Use the INFERRED rows above as hypotheses for NAS FM's own "
-                "programming experiments.",
-                evidence=f"{len(inferred_with_input)} INFERRED finding(s) with a planning input",
+                observation=(
+                    "Use the INFERRED hypotheses above for NAS FM's own programming experiments."
+                ),
+                evidence=f"{len(inferred_with_input)} INFERRED finding(s) with planning input",
                 occurrences=len(inferred_with_input),
-                confidence=None,
-                nas_fm_planning_input="None should be treated as proof without multi-day "
-                "monitoring across more sessions; a single session is a starting hypothesis, "
-                "not a conclusion.",
+                confidence=0.5,
+                confidence_basis="Derived from multiple INFERRED broadcast observations",
+                evidence_refs=[r for i in inferred_with_input for r in i.evidence_refs[:2]],
+                limitations=[
+                    "None should be treated as proof without multi-day monitoring; "
+                    "a single session is a hypothesis, not a final schedule conclusion."
+                ],
+                nas_fm_planning_input=(
+                    "None should be treated as proof without multi-day monitoring "
+                    "across more sessions; a single session is a starting hypothesis, "
+                    "not a conclusion."
+                ),
             )
         )
     return insights
 
 
 # ------------------------------------------------------------------------------------- top level
-def build_programming_analysis(db: Database, session_id: str) -> dict[str, Any]:
-    """Pure function of the database state for ``session_id``: deterministic and reproducible."""
+def build_programming_analysis(
+    db: Database,
+    session_id: str,
+    *,
+    expects_transcription: bool = True,
+    is_dependency_unavailable: bool = False,
+) -> dict[str, Any]:
+    """Pure, deterministic read of database state with strict analytical validity gates."""
     session = db.session(session_id)
     if not session:
         raise KeyError(f"unknown session: {session_id}")
@@ -667,36 +1042,106 @@ def build_programming_analysis(db: Database, session_id: str) -> dict[str, Any]:
     tz = station_timezone(session.get("timezone"))
 
     segments = build_timeline(chunks, events)
+    coverage_metrics = compute_timeline_coverage(chunks, segments)
+    tz_meta = timezone_metadata(tz)
+
+    captured = coverage_metrics.captured_seconds
+    speech_events = [e for e in events if e.get("kind") == "speech" and e.get("text")]
+    transcription_failures = sum(
+        1 for i in incidents if i["kind"] in ("analysis_failure", "transcription_incident")
+    )
+    critical_incidents = sum(
+        1 for i in incidents if i["kind"] in ("capture_error", "monitor_error")
+    )
+
+    confs = [float(e["confidence"]) for e in speech_events if e.get("confidence") is not None]
+    mean_conf = sum(confs) / len(confs) if confs else None
+
+    # Evaluate analytical validity
+    target_s = float(session.get("target_seconds", 600.0))
+    validity = evaluate_analytical_validity(
+        has_chunks=bool(chunks),
+        captured_seconds=captured,
+        expected_seconds=target_s,
+        chunk_count=len(chunks),
+        unanalyzed_chunks=sum(1 for c in chunks if not c["analyzed"]),
+        expects_transcription=expects_transcription,
+        transcription_failures=transcription_failures,
+        speech_events_count=len(speech_events),
+        mean_speech_confidence=mean_conf,
+        timeline_coverage_percent=coverage_metrics.coverage_percent,
+        critical_incidents_count=critical_incidents,
+        stopped_early=(session.get("status") == "stopped"),
+        is_dependency_unavailable=is_dependency_unavailable,
+        is_insufficient_sample=(captured < 3600.0),
+    )
+
+    # Determine whether transcription was valid
+    transcription_valid = (
+        validity.transcription_status == TranscriptionStatus.COMPLETED
+        and validity.classification_status
+        in (ClassificationStatus.COMPLETED, ClassificationStatus.LIMITED)
+        and validity.programming_analysis_status != ProgrammingAnalysisStatus.BLOCKED
+    )
+
     blocks = content_blocks(chunks, events)
-    candidates = program_candidates(blocks, tz)
-    patterns = clock_patterns(events, chunks, blocks, segments, tz)
-    dayparts = daypart_analysis(segments, blocks, candidates, patterns, tz)
-    insights = programming_diagnostics(segments, blocks, candidates, patterns)
+    candidates = (
+        program_candidates(blocks, tz, total_sample_seconds=captured) if transcription_valid else []
+    )
+    patterns = (
+        clock_patterns(events, chunks, blocks, segments, tz, total_sample_seconds=captured)
+        if transcription_valid
+        else []
+    )
+    dayparts = daypart_analysis(
+        segments, blocks, candidates, patterns, tz, transcription_valid=transcription_valid
+    )
+    insights = programming_diagnostics(
+        segments,
+        blocks,
+        candidates,
+        patterns,
+        transcription_valid=transcription_valid,
+        total_captured_seconds=captured,
+        failures_count=transcription_failures,
+    )
     recurrent = recurrent_candidates(chunks, events)
 
-    covered = sum(s.duration_seconds for s in segments if s.kind != "capture_gap")
-    captured = sum(float(c["duration_seconds"]) for c in chunks)
     duration_seconds = (
         (parse_iso(session["ended_at"]) - parse_iso(session["started_at"])).total_seconds()
         if session.get("ended_at")
         else None
     )
+
     return {
         "schema_version": 1,
         "session_id": session_id,
         "station": session["station_name"],
-        "timezone": str(getattr(tz, "key", tz)),
+        "timezone": tz_meta["timezone"],
+        "timezone_offset": tz_meta["offset_iso"],
+        "validity": validity.to_dict(),
+        "status": {
+            "capture_status": validity.capture_status.value,
+            "processing_status": validity.processing_status.value,
+            "transcription_status": validity.transcription_status.value,
+            "classification_status": validity.classification_status.value,
+            "programming_analysis_status": validity.programming_analysis_status.value,
+            "decision_readiness": validity.decision_readiness.value,
+            "reasons": validity.reasons,
+        },
         "content_blocks": [b.to_dict() for b in blocks],
         "program_candidates": [c.to_dict() for c in candidates],
         "clock_patterns": [p.to_dict() for p in patterns],
         "dayparts": [d.to_dict() for d in dayparts],
         "insights": [i.to_dict() for i in insights],
+        "programming_intelligence": [i.to_dict() for i in insights],
         "recurrent_elements": recurrent,
+        "coverage_metrics": coverage_metrics.to_dict(),
         "study_summary": {
             "duration_seconds": (
                 round(duration_seconds, 1) if duration_seconds is not None else None
             ),
-            "timeline_coverage_pct": round(covered / captured * 100, 1) if captured else 0.0,
+            "timeline_coverage_pct": coverage_metrics.coverage_percent,
             "content_block_count": len(blocks),
             "program_candidate_count": len(candidates),
             "clock_pattern_count": len(patterns),

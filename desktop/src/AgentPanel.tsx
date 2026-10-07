@@ -263,44 +263,42 @@ export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: Agent
       />
 
       {/* Main Workspace Navigation Tabs */}
-      {status && (
-        <nav className="workspace-nav" aria-label="Workspace views">
-          <button
-            type="button"
-            className={`tab-btn ${activeTab === "overview" ? "active" : ""}`}
-            onClick={() => setActiveTab("overview")}
-          >
-            Overview
-          </button>
-          <button
-            type="button"
-            className={`tab-btn ${activeTab === "timeline" ? "active" : ""}`}
-            onClick={() => setActiveTab("timeline")}
-          >
-            Timeline
-          </button>
-          <button
-            type="button"
-            className={`tab-btn ${activeTab === "programming" ? "active" : ""}`}
-            onClick={() => {
-              if (!programming && runId) void handleViewProgramming();
-              else setActiveTab("programming");
-            }}
-          >
-            Programming Intelligence
-          </button>
-          <button
-            type="button"
-            className={`tab-btn ${activeTab === "export" ? "active" : ""}`}
-            onClick={() => setActiveTab("export")}
-          >
-            Export
-          </button>
-        </nav>
-      )}
+      <nav className="workspace-nav" aria-label="Workspace views">
+        <button
+          type="button"
+          className={`tab-btn ${activeTab === "overview" ? "active" : ""}`}
+          onClick={() => setActiveTab("overview")}
+        >
+          Overview
+        </button>
+        <button
+          type="button"
+          className={`tab-btn ${activeTab === "timeline" ? "active" : ""}`}
+          onClick={() => setActiveTab("timeline")}
+        >
+          Timeline
+        </button>
+        <button
+          type="button"
+          className={`tab-btn ${activeTab === "programming" ? "active" : ""}`}
+          onClick={() => {
+            if (!programming && runId) void handleViewProgramming();
+            else setActiveTab("programming");
+          }}
+        >
+          Programming Intelligence
+        </button>
+        <button
+          type="button"
+          className={`tab-btn ${activeTab === "export" ? "active" : ""}`}
+          onClick={() => setActiveTab("export")}
+        >
+          Export
+        </button>
+      </nav>
 
       {/* Active Tab View */}
-      {status && activeTab === "overview" && (
+      {activeTab === "overview" && (
         <OverviewView
           status={status}
           timeline={timeline}
@@ -314,25 +312,46 @@ export default function AgentPanel({ api = defaultApi, pollMs = POLL_MS }: Agent
         />
       )}
 
-      {status && activeTab === "timeline" && (
-        <TimelineView timeline={timeline} />
+      {activeTab === "timeline" && (
+        status ? (
+          <TimelineView timeline={timeline} />
+        ) : (
+          <div className="empty-workspace-state">
+            <h3>Evidence Timeline</h3>
+            <p>No active monitoring session. Start monitoring a station to capture audio and generate chronological speech/silence segments.</p>
+          </div>
+        )
       )}
 
-      {status && activeTab === "programming" && (
-        <ProgrammingView
-          programming={programming}
-          onRefresh={() => void handleViewProgramming()}
-        />
+      {activeTab === "programming" && (
+        status ? (
+          <ProgrammingView
+            programming={programming}
+            onRefresh={() => void handleViewProgramming()}
+          />
+        ) : (
+          <div className="empty-workspace-state">
+            <h3>Programming Intelligence</h3>
+            <p>Programming intelligence analyzes broadcast patterns, program boundaries, dayparts, and clock models once monitoring audio is captured.</p>
+          </div>
+        )
       )}
 
-      {status && activeTab === "export" && (
-        <ExportView
-          status={status}
-          journal={journal}
-          exportNote={exportNote}
-          onExportExcel={() => void handleExport()}
-          terminal={terminal}
-        />
+      {activeTab === "export" && (
+        status ? (
+          <ExportView
+            status={status}
+            journal={journal}
+            exportNote={exportNote}
+            onExportExcel={() => void handleExport()}
+            terminal={terminal}
+          />
+        ) : (
+          <div className="empty-workspace-state">
+            <h3>Reports & Excel Export</h3>
+            <p>Export audit-ready multi-tab Excel workbooks and executive summaries upon completing a station monitoring run.</p>
+          </div>
+        )
       )}
 
       {/* Window-close Confirmation Modal */}
