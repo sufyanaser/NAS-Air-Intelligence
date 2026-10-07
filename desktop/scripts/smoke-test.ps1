@@ -31,12 +31,18 @@ public static class WinEnum {
   [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
   [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
   [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+  [DllImport("user32.dll")] static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr w, IntPtr l);
   public static List<string> Visible(HashSet<uint> pids) {
     var r = new List<string>();
     EnumWindows((h, l) => { uint pid; GetWindowThreadProcessId(h, out pid);
       if (pids.Contains(pid) && IsWindowVisible(h)) { var sb = new StringBuilder(256); GetClassName(h, sb, 256); r.Add(pid + ":" + sb); }
       return true; }, IntPtr.Zero);
     return r;
+  }
+  public static void Close(HashSet<uint> pids) {
+    EnumWindows((h, l) => { uint pid; GetWindowThreadProcessId(h, out pid);
+      if (pids.Contains(pid) && IsWindowVisible(h)) { PostMessage(h, 0x0010, IntPtr.Zero, IntPtr.Zero); }
+      return true; }, IntPtr.Zero);
   }
 }
 "@
@@ -109,7 +115,18 @@ $visibleAll = [WinEnum]::Visible($treePids) | Where-Object { $_ -match "ConsoleW
 Check "No visible console window anywhere in the tree" (-not $visibleAll) ($visibleAll -join ",")
 
 # 3) graceful close leaves nothing behind
-[void]$app.CloseMainWindow()
+Add-Type -AssemblyName UIAutomationClient
+$win = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
+    [System.Windows.Automation.TreeScope]::Children,
+    [System.Windows.Automation.Condition]::TrueCondition) |
+    Where-Object { $_.Current.ProcessId -eq $app.Id -and $_.Current.Name -eq 'NAS Air Intelligence' } |
+    Select-Object -First 1
+if ($win) {
+    $win.GetCurrentPattern([System.Windows.Automation.WindowPattern]::Pattern).Close()
+} else {
+    [void]$app.CloseMainWindow()
+    [WinEnum]::Close($treePids)
+}
 $null = $app.WaitForExit(15000)
 Start-Sleep -Seconds 2
 Check "App exited on close" $app.HasExited
