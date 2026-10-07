@@ -64,13 +64,107 @@ def _tier(kind: str, confidence: float | None) -> str:
     return "Likely"  # model-derived classes such as music/noise from an ML adapter
 
 
+@dataclass
+class TimelineCoverageMetrics:
+    captured_seconds: float
+    unique_covered_seconds: float
+    gap_seconds: float
+    overlap_seconds: float
+    coverage_percent: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "captured_seconds": round(self.captured_seconds, 1),
+            "unique_covered_seconds": round(self.unique_covered_seconds, 1),
+            "gap_seconds": round(self.gap_seconds, 1),
+            "overlap_seconds": round(self.overlap_seconds, 1),
+            "coverage_percent": round(self.coverage_percent, 2),
+        }
+
+
+def compute_timeline_coverage(
+    chunks: list[dict[str, Any]],
+    segments: list[TimelineSegment],
+) -> TimelineCoverageMetrics:
+    """Calculate timeline coverage based on unique covered seconds / captured audio seconds.
+
+    Guarantees:
+    - coverage_percent never exceeds 100.0
+    - separately tracks captured_seconds, unique_covered_seconds, gap_seconds, overlap_seconds
+    """
+    captured_seconds = sum(float(c["duration_seconds"]) for c in chunks)
+    gap_seconds = sum(s.duration_seconds for s in segments if s.kind == "capture_gap")
+
+    # Calculate chunk-level overlaps
+    overlap_seconds = 0.0
+    sorted_chunks = sorted(chunks, key=lambda c: c["started_at"])
+    prev_chunk_end: datetime | None = None
+    for c in sorted_chunks:
+        c_start = parse_iso(c["started_at"])
+        c_dur = float(c["duration_seconds"])
+        c_end = c_start + timedelta(seconds=c_dur)
+        if prev_chunk_end is not None and c_start < prev_chunk_end:
+            chunk_overlap = (prev_chunk_end - c_start).total_seconds()
+            overlap_seconds += max(0.0, chunk_overlap)
+        prev_chunk_end = max(prev_chunk_end, c_end) if prev_chunk_end else c_end
+
+    # Calculate unique covered audio intervals (non-gap segments)
+    real_segments = [s for s in segments if s.kind != "capture_gap"]
+    if not real_segments:
+        unique_covered_seconds = 0.0
+    else:
+        intervals = sorted([(s.start, s.end) for s in real_segments], key=lambda x: x[0])
+        merged: list[list[datetime]] = []
+        for start, end in intervals:
+            if not merged:
+                merged.append([start, end])
+            else:
+                last_end = merged[-1][1]
+                if start < last_end:
+                    merged[-1][1] = max(last_end, end)
+                else:
+                    merged.append([start, end])
+        unique_covered_seconds = sum((end - start).total_seconds() for start, end in merged)
+
+    # Invariant: unique covered seconds cannot exceed captured seconds
+    if captured_seconds > 0:
+        raw_pct = (unique_covered_seconds / captured_seconds) * 100.0
+        coverage_percent = min(100.0, max(0.0, raw_pct))
+    else:
+        coverage_percent = 0.0
+
+    return TimelineCoverageMetrics(
+        captured_seconds=captured_seconds,
+        unique_covered_seconds=min(captured_seconds, unique_covered_seconds),
+        gap_seconds=gap_seconds,
+        overlap_seconds=overlap_seconds,
+        coverage_percent=coverage_percent,
+    )
+
+
+def timezone_metadata(tz: tzinfo) -> dict[str, Any]:
+    """Explicit timezone metadata for audit and display."""
+    now = datetime.now(tz)
+    offset = now.utcoffset()
+    offset_seconds = int(offset.total_seconds()) if offset else 0
+    h, rem = divmod(abs(offset_seconds), 3600)
+    sign = "+" if offset_seconds >= 0 else "-"
+    offset_iso = f"{sign}{h:02d}:{rem // 60:02d}"
+    tz_name = getattr(tz, "key", str(tz))
+    return {
+        "timezone": tz_name,
+        "offset_seconds": offset_seconds,
+        "offset_iso": offset_iso,
+    }
+
+
 def station_timezone(name: str | None) -> tzinfo:
     try:
         from zoneinfo import ZoneInfo
 
-        return ZoneInfo(name or "UTC")
+        return ZoneInfo(name or "Asia/Baghdad")
     except Exception:
-        return timezone(timedelta(hours=3)) if name == "Asia/Baghdad" else UTC
+        return timezone(timedelta(hours=3)) if (name == "Asia/Baghdad" or not name) else UTC
 
 
 def _chunk_segments(chunk: dict[str, Any], events: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -133,7 +227,7 @@ def build_timeline(
                         "conf": [],
                     }  # fmt: skip
                 )
-            elif gap < 0:
+            elif -GAP_TOLERANCE_SECONDS <= gap < 0:
                 start = previous_end  # sub-tolerance overlap from mtime-derived timestamps
         for piece in _chunk_segments(chunk, by_chunk.get(chunk["id"], [])):
             raw.append(
@@ -143,7 +237,8 @@ def build_timeline(
                     "end": start + timedelta(seconds=piece["end"]),
                 }
             )
-        previous_end = start + timedelta(seconds=float(chunk["duration_seconds"]))
+        chunk_end = start + timedelta(seconds=float(chunk["duration_seconds"]))
+        previous_end = max(previous_end, chunk_end) if previous_end is not None else chunk_end
 
     merged: list[dict[str, Any]] = []
     for piece in raw:
@@ -155,7 +250,7 @@ def build_timeline(
             and piece["kind"] != "capture_gap"
         )
         if contiguous:
-            last["end"] = piece["end"]
+            last["end"] = max(last["end"], piece["end"])
             last["ids"] |= piece["ids"]
             last["conf"].extend(piece["conf"])
         else:

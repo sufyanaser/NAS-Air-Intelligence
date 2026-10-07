@@ -339,9 +339,24 @@ export default function OverviewView({
       {terminal && status.result && (
         <div className="panel result-panel" aria-label="Result">
           <div className="panel-header-inline">
-            <h2>Result</h2>
-            <span className="panel-tag">Quality Gates</span>
+            <h2>Result & Analytical Validity</h2>
+            <span className="panel-tag">Decision Readiness</span>
           </div>
+          <div className="validity-readiness-row">
+            <span
+              className={`readiness-badge readiness-${(status.result.decision_readiness || status.result.validity?.decision_readiness || "NOT_READY").toLowerCase()}`}
+            >
+              DECISION READINESS: {status.result.decision_readiness || status.result.validity?.decision_readiness || "NOT_READY"}
+            </span>
+          </div>
+          {status.result.validity && (
+            <div className="component-status-mini-grid">
+              <span className="status-pill">Capture: {status.result.validity.capture_status}</span>
+              <span className="status-pill">Transcription: {status.result.validity.transcription_status}</span>
+              <span className="status-pill">Classification: {status.result.validity.classification_status}</span>
+              <span className="status-pill">Programming: {status.result.validity.programming_analysis_status}</span>
+            </div>
+          )}
           <p className="result-summary-text">{status.result.executive_summary}</p>
           <ul className="gate-list">
             {Object.entries(status.result.gates).map(([gate, verdict]) => (
