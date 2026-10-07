@@ -150,6 +150,24 @@ def live_metrics(db: Database, session_id: str | None) -> dict[str, Any]:
     }
 
 
+def resolve_session_for_study(
+    store: AgentStore, db: Database, ident: str
+) -> tuple[str, float, dict[str, Any] | None]:
+    """An agent-run id/prefix, or a bare session id: either way resolve to
+    (session_id, requested_seconds, run-or-None). Shared by the CLI's and the sidecar's
+    ``programming``/``export`` surfaces, which study data by session regardless of whether
+    it was captured through the agent or the plain ``monitor`` command."""
+    run = store.find(ident)
+    if run:
+        if not run.get("session_id"):
+            raise KeyError(f"agent run {ident} has no session yet (it has not started capturing)")
+        return run["session_id"], float(run["duration_seconds"]), run
+    session = db.session(ident)
+    if not session:
+        raise KeyError(f"unknown agent run or session: {ident}")
+    return ident, float(session["target_seconds"]), None
+
+
 def live_timeline(db: Database, session_id: str | None) -> dict[str, Any]:
     """Timeline segments plus "Current Material" for an in-progress or finished session."""
     if not session_id:

@@ -16,6 +16,7 @@ dependencies = [
   "fastapi>=0.115,<1",
   "uvicorn[standard]>=0.32,<1",
   "pydantic>=2.9,<3",
+  "openpyxl>=3.1,<4",
 ]
 
 [project.optional-dependencies]
@@ -37,6 +38,24 @@ dev = [
 
 [project.scripts]
 nas-air = "nas_air_intelligence.cli:main"
+
+[tool.hatch.build]
+# Without this, hatchling's default sdist sweeps up the whole project tree - including
+# desktop/node_modules, Rust build output, and any local runtime data/recordings - producing
+# a multi-gigabyte artifact instead of a source distribution. None of that belongs in the
+# Python package; the desktop app is built and shipped separately (see desktop/).
+exclude = [
+  "desktop/node_modules",
+  "desktop/dist",
+  "desktop/src-tauri/target",
+  "desktop/src-tauri/gen",
+  "desktop/src-tauri/binaries",
+  "desktop/.sidecar-build",
+  "data",
+  ".venv",
+  "dist",
+  "build",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nas_air_intelligence"]
