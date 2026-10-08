@@ -25,6 +25,9 @@ reports/
 .env
 .env.*
 !.env.example
+*.key
+*.key.pub
+.keys/
 
 # IDE / OS
 .vscode/

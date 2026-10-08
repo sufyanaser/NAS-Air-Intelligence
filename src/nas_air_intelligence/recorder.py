@@ -11,6 +11,7 @@ from pathlib import Path
 from .analysis import Analyzer, analyze_pending_chunks
 from .db import Database
 from .ffmpeg import find_binary, probe_duration
+from .process import popen_silent, run_silent
 from .reporting import write_report_files
 from .util import isoformat, sha256_file
 
@@ -56,12 +57,12 @@ def _is_ffmpeg_process(pid: int) -> bool:
     """True only if ``pid`` is alive and is an ffmpeg process (guards against PID reuse)."""
     try:
         if os.name == "nt":
-            out = subprocess.run(
+            out = run_silent(
                 ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                 capture_output=True, text=True, timeout=10, check=False,
             ).stdout  # fmt: skip
         else:
-            out = subprocess.run(
+            out = run_silent(
                 ["ps", "-p", str(pid), "-o", "comm="],
                 capture_output=True, text=True, timeout=10, check=False,
             ).stdout  # fmt: skip
@@ -84,7 +85,7 @@ def reap_orphan_ffmpeg(output_dir: Path) -> int | None:
     killed: int | None = None
     if _is_ffmpeg_process(pid):
         if os.name == "nt":
-            subprocess.run(
+            run_silent(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
                 capture_output=True, timeout=15, check=False,
             )  # fmt: skip
@@ -236,7 +237,7 @@ class StreamMonitor:
                 ]
                 attempt_log = output_dir / f"ffmpeg-{next_segment_number:06d}.log"
                 with attempt_log.open("w", encoding="utf-8") as log_handle:
-                    process = subprocess.Popen(
+                    process = popen_silent(
                         command,
                         stdin=subprocess.PIPE,  # lets us ask ffmpeg to finalize with 'q'
                         stdout=subprocess.DEVNULL,

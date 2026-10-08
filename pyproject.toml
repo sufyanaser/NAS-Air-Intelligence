@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "nas-air-intelligence"
-version = "0.1.0"
+version = "0.3.0"
 description = "Background radio stream monitoring and broadcast-intelligence pipeline for NAS FM."
 readme = "README.md"
 requires-python = ">=3.11"

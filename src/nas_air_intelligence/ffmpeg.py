@@ -6,6 +6,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .process import run_silent
+
 SILENCE_START_RE = re.compile(r"silence_start:\s*(?P<value>-?\d+(?:\.\d+)?)")
 SILENCE_END_RE = re.compile(r"silence_end:\s*(?P<value>-?\d+(?:\.\d+)?)")
 
@@ -23,7 +25,7 @@ def find_binary(name: str) -> str:
 
 def probe_duration(path: str | Path, ffprobe: str = "ffprobe") -> float:
     executable = find_binary(ffprobe)
-    proc = subprocess.run(
+    proc = run_silent(
         [
             executable,
             "-v",
@@ -87,7 +89,7 @@ def silence_intervals(
     minimum_silence: float = 1.0,
 ) -> list[tuple[str, float, float]]:
     executable = find_binary(ffmpeg)
-    proc = subprocess.run(
+    proc = run_silent(
         [
             executable,
             "-hide_banner",
@@ -134,7 +136,7 @@ def acoustic_fingerprint(
     cmd.extend(["-f", "chromaprint", "-fp_format", "base64", "-"])
 
     try:
-        proc = subprocess.run(
+        proc = run_silent(
             cmd,
             capture_output=True,
             text=True,

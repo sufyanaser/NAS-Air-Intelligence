@@ -72,4 +72,30 @@ describe("UpdatePanel", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("signature invalid");
     expect(api.relaunch).not.toHaveBeenCalled();
   });
+
+  it("shows download progress percentage when totalBytes is known", async () => {
+    const update = fakeUpdate({
+      downloadAndInstall: vi.fn().mockImplementation(async (onEvent) => {
+        onEvent?.({ event: "Started", data: { contentLength: 200 } });
+        onEvent?.({ event: "Progress", data: { chunkLength: 100 } });
+      }),
+    });
+    const api = makeApi({ check: vi.fn().mockResolvedValue(update) });
+    render(<UpdatePanel api={api} />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    fireEvent.click(await screen.findByRole("button", { name: /download and install/i }));
+    expect(await screen.findByText(/downloading update… 50%/i)).toBeInTheDocument();
+  });
+
+  it("allows re-checking after an initial check failure", async () => {
+    const api = makeApi({ check: vi.fn().mockRejectedValueOnce(new Error("temporary outage")) });
+    render(<UpdatePanel api={api} />);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("temporary outage");
+
+    // Retry check succeeds
+    api.check = vi.fn().mockResolvedValueOnce(null);
+    fireEvent.click(screen.getByRole("button", { name: /check for updates/i }));
+    expect(await screen.findByText(/up to date/i)).toBeInTheDocument();
+  });
 });
